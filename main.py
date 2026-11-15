@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
 """
-Art-Net JSON sequence recorder (local UDP server with a small GUI).
+Art Stream Sequence Recorder (local UDP server with a small GUI).
 
 Listens for Art-Net (ArtDMX) packets on a given IP/port (default 127.0.0.1:6454),
-records the stream from TouchDesigner / Madrix 5 at a fixed frame rate and saves it as JSON:
-a header (all values stored as strings) plus "sequence": {"data": [...]} with floats in 0..1.
+records the stream from TouchDesigner / Madrix 5 at a fixed frame rate and saves it
+as a binary .plsq file (any size) or JSON (1-2 universes only).
 
 Run:      python main.py        (Python 3.9+, no extra packages)
 Build:    pyinstaller --onefile --noconsole main.py
 """
 
-import collections
-import json
 import os
 import queue
-import re
-import socket
-import struct
 import threading
 import time
 
@@ -28,554 +23,15 @@ except ImportError:  # the core can still be imported without tkinter (for tests
 
 from mapping import build_spans, effective_chips_per_universe
 from plsq import PlsqWriter, build_meta
+from session import (
+    ARTNET_ID, OP_DMX, OP_SYNC, RCVBUF_SIZE,
+    parse_artdmx, postprocess, _blend_frames, write_json, _LUT,
+    path_key, next_free_path,
+    ArtNetServer, FrameAssembler, Recorder, PlsqStreamWriter,
+    PlsqRecordingSession,
+)
 
 APPV = "1.2.0"
-ARTNET_ID = b"Art-Net\x00"
-OP_DMX  = 0x5000
-OP_SYNC = 0x5200
-RCVBUF_SIZE = 32 * 1024 * 1024   # 32 MiB requested; kernel may cap on Windows
-
-
-# ----------------------------------------------------------------------------
-#  Core: Art-Net parsing, receiving, recording, post-processing, export
-# ----------------------------------------------------------------------------
-def parse_artdmx(data):
-    """ArtDMX packet -> (port_address, sequence, dmx_bytes), or None if it is not ArtDMX."""
-    if len(data) < 18 or data[:8] != ARTNET_ID:
-        return None
-    if (data[8] | (data[9] << 8)) != OP_DMX:
-        return None
-    length = (data[16] << 8) | data[17]
-    port_address = ((data[15] & 0x7F) << 8) | data[14]  # Net:SubNet:Universe (0-based)
-    return port_address, data[12], bytes(data[18 : 18 + length])
-
-
-class FrameAssembler:
-    """
-    Anti-tearing frame assembler for multi-universe sources.
-
-    Groups incoming per-universe packets into complete source frames.
-    Commits a new `committed_frame` (immutable bytes) when:
-      (a) all mapped universes have been updated since the last commit, or
-      (b) an ArtSync packet (OpCode 0x5200) arrives, or
-      (c) a mapped universe arrives a second time before all others: commit the
-          partial working frame and start a new one with the duplicate as the
-          first update (counted in `partial_count`).
-
-    `committed_frame` is replaced by a plain reference swap, which is atomic
-    under CPython's GIL; the sampler thread reads it without a lock.
-
-    When `enabled` is False the assembler is a no-op; callers fall back to the
-    old sample-the-latest behavior.
-    """
-
-    def __init__(self):
-        self.enabled = True
-        self.committed_frame = None   # bytes | None; read by sampler thread
-        self.partial_count = 0        # partial commits (repeat-universe or ArtSync with partial data)
-        self._working = None          # bytearray; written only by the receive thread
-        self._expected = frozenset()  # universes that must all arrive for a full commit
-        self._updated = set()         # universes updated since last commit
-        self._spans_by_uni = {}       # port_address -> (ch_start, n_channels, frame_offset)
-
-    def start(self, spans, stride):
-        """Configure for a new recording. Must be called before the server begins
-        calling on_universe()."""
-        self._spans_by_uni = {uni: (ch, n, off) for uni, ch, n, off in spans}
-        self._expected = frozenset(self._spans_by_uni)
-        self._working = bytearray(stride)
-        self._updated = set()
-        self.committed_frame = None
-        self.partial_count = 0
-
-    def on_universe(self, port_address, mv, pkt_len, dmx_len):
-        """
-        Called from the receive thread for each valid ArtDMX packet.
-        mv is a memoryview of the full receive buffer; payload starts at byte 18.
-        """
-        if not self.enabled:
-            return
-        span = self._spans_by_uni.get(port_address)
-        if span is None:
-            return
-        ch, n_ch, off = span
-
-        if port_address in self._updated:
-            # Universe repeated before all mapped universes arrived → partial commit
-            self._commit(partial=True)
-
-        src_start = 18 + ch
-        src_end = src_start + n_ch
-        if src_end <= 18 + dmx_len:
-            self._working[off:off + n_ch] = mv[src_start:src_end]
-        self._updated.add(port_address)
-
-        if self._updated >= self._expected:
-            self._commit(partial=False)
-
-    def on_artsync(self):
-        """Force a commit on ArtSync if at least one universe arrived."""
-        if not self.enabled or not self._updated:
-            return
-        self._commit(partial=False)
-
-    def _commit(self, partial):
-        self.committed_frame = bytes(self._working)  # atomic reference swap under GIL
-        self._updated = set()
-        if partial:
-            self.partial_count += 1
-
-
-class ArtNetServer:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.latest = {}      # port_address -> bytes(512), most recent data
-        self.uni_stats = {}   # port_address -> {"count": int, "length": int}
-        self.total_packets = 0
-        self.ignored_packets = 0
-        self.total_bytes = 0
-        self.last_packet_time = 0.0
-        self.lost_packets = 0   # approximate sequence-gap count
-        self.rcvbuf_actual = 0  # actual SO_RCVBUF reported by the kernel
-        self.running = False
-        self.error = None
-        self.host = ""
-        self.port = 0
-        self._sock = None
-        self._thread = None
-        self._assembler = None          # FrameAssembler | None
-        self._seq_last = {}             # port_address -> last seq byte (1..255)
-
-    def start(self, host, port):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            sock.bind((host, port))
-        except OSError:
-            sock.close()
-            raise
-        sock.settimeout(0.2)
-        with self.lock:
-            self.latest.clear()
-            self.uni_stats.clear()
-            self.total_packets = self.ignored_packets = self.total_bytes = 0
-            self.last_packet_time = 0.0
-            self.lost_packets = 0
-            self.rcvbuf_actual = 0
-        self._seq_last.clear()
-        self.error = None
-        self._sock, self.host, self.port, self.running = sock, host, port, True
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self.running = False
-        if self._thread:
-            self._thread.join(timeout=1.0)
-        if self._sock:
-            self._sock.close()
-        self._sock = self._thread = None
-
-    def set_assembler(self, assembler):
-        """Attach or detach a FrameAssembler. Thread-safe (guarded by lock)."""
-        with self.lock:
-            self._assembler = assembler
-
-    def _loop(self):
-        # Request a large receive buffer before the first recvfrom
-        try:
-            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RCVBUF_SIZE)
-        except OSError:
-            pass
-        actual = self._sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
-        with self.lock:
-            self.rcvbuf_actual = actual
-
-        _buf = bytearray(2048)
-        _mv = memoryview(_buf)
-        sock = self._sock
-
-        while self.running:
-            try:
-                n, _addr = sock.recvfrom_into(_mv)
-            except socket.timeout:
-                continue
-            except OSError as exc:
-                if self.running:
-                    self.error = "Server socket error: %s" % exc
-                    self.running = False
-                break
-
-            if n < 10 or _buf[:8] != ARTNET_ID:
-                with self.lock:
-                    self.total_packets += 1
-                    self.total_bytes += n
-                    self.ignored_packets += 1
-                continue
-
-            opcode = _buf[8] | (_buf[9] << 8)
-            now = time.perf_counter()
-
-            if opcode == OP_DMX and n >= 18:
-                dmx_len = (_buf[16] << 8) | _buf[17]
-                if 18 + dmx_len > n:
-                    dmx_len = n - 18
-                port_address = ((_buf[15] & 0x7F) << 8) | _buf[14]
-                seq = _buf[12]
-
-                with self.lock:
-                    self.total_packets += 1
-                    self.total_bytes += n
-                    self.last_packet_time = now
-                    if seq != 0:
-                        last_s = self._seq_last.get(port_address)
-                        if last_s is not None:
-                            expected_s = last_s % 255 + 1
-                            if expected_s != seq:
-                                gap = (seq - expected_s + 255) % 255
-                                if 0 < gap <= 128:
-                                    self.lost_packets += gap
-                        self._seq_last[port_address] = seq
-                    cap = min(dmx_len, 512)
-                    padded = bytes(_mv[18:18 + cap]) + b"\x00" * (512 - cap)
-                    self.latest[port_address] = padded
-                    st = self.uni_stats.setdefault(port_address, {"count": 0, "length": 0})
-                    st["count"] += 1
-                    st["length"] = dmx_len
-
-                asm = self._assembler   # read under GIL; atomic
-                if asm is not None:
-                    asm.on_universe(port_address, _mv, n, dmx_len)
-
-            elif opcode == OP_SYNC:
-                with self.lock:
-                    self.total_packets += 1
-                    self.total_bytes += n
-                    self.last_packet_time = now
-                asm = self._assembler
-                if asm is not None:
-                    asm.on_artsync()
-
-            else:
-                with self.lock:
-                    self.total_packets += 1
-                    self.total_bytes += n
-                    self.ignored_packets += 1
-
-    def snapshot(self):
-        with self.lock:
-            return (
-                dict(self.latest),
-                {k: dict(v) for k, v in self.uni_stats.items()},
-                self.total_packets,
-                self.ignored_packets,
-                self.total_bytes,
-                self.last_packet_time,
-                self.lost_packets,
-                self.rcvbuf_actual,
-            )
-
-
-
-class Recorder:
-    """Samples the latest server data at a fixed fps and collects frames (bytes 0..255)."""
-
-    def __init__(self, server):
-        self.server = server
-        self.frames = []
-        self.frames_captured = 0  # counts all frames put to frames or out_queue
-        self.stride = 0
-        self.fps = 30.0
-        self.max_frames = 0
-        self.spans = []
-        self.state = "idle"  # idle | waiting | recording | done
-        self.missing = 0    # frames with at least one universe missing
-        self.late = 0       # frames sampled more than 1.5 periods late
-        self.elapsed = 0.0
-        self.error = None
-        self._assembler = None  # FrameAssembler | None
-        self._out_queue = None  # queue.Queue | None (PLSQ streaming mode)
-        self._stop = threading.Event()
-        self._thread = None
-
-    @property
-    def partial_source_frames(self):
-        return self._assembler.partial_count if self._assembler is not None else 0
-
-    def start(self, spans, stride, fps, max_frames=0, wait_first_packet=True,
-              assembler=None, out_queue=None):
-        self.frames, self.spans, self.stride = [], spans, stride
-        self.fps, self.max_frames = float(fps), int(max_frames)
-        self.frames_captured = 0
-        self.missing = self.late = 0
-        self.elapsed = 0.0
-        self.error = None
-        self._assembler = assembler
-        self._out_queue = out_queue
-        self._stop.clear()
-        self.state = "waiting" if wait_first_packet else "recording"
-        self._thread = threading.Thread(
-            target=self._run, args=(wait_first_packet,), daemon=True
-        )
-        self._thread.start()
-
-    def stop(self):
-        self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=2.0)
-
-    def _sample(self):
-        asm = self._assembler
-        if asm is not None and asm.enabled:
-            frame = asm.committed_frame
-            return frame, (frame is None)
-        with self.server.lock:
-            latest = self.server.latest
-            out, miss = bytearray(self.stride), False
-            for uni, ch, n, off in self.spans:
-                buf = latest.get(uni)
-                if buf is None:
-                    miss = True
-                    continue
-                out[off : off + n] = buf[ch : ch + n]
-        return bytes(out), miss
-
-    def _run(self, wait_first_packet):
-        try:
-            self._capture(wait_first_packet)
-        except Exception as exc:
-            self.error = "Recorder failed: %s" % exc
-        finally:
-            self.state = "done"
-
-    def _capture(self, wait_first_packet):
-        if wait_first_packet:
-            while not self._stop.is_set():
-                with self.server.lock:
-                    have = any(s[0] in self.server.latest for s in self.spans)
-                if have:
-                    break
-                time.sleep(0.005)
-            if self._stop.is_set():
-                return
-            self.state = "recording"
-        period = 1.0 / self.fps
-        t0 = time.perf_counter()
-        k = 0
-        while not self._stop.is_set():
-            target = t0 + k * period
-            while not self._stop.is_set():
-                dt = target - time.perf_counter()
-                if dt <= 0:
-                    break
-                time.sleep(dt - 0.002 if dt > 0.004 else 0)
-            if self._stop.is_set():
-                break
-            now = time.perf_counter()
-            if now - target > 1.5 * period:
-                self.late += 1
-            frame, miss = self._sample()
-            if frame is None:
-                frame = bytes(self.stride)  # zeros while no frame committed yet
-            if self._out_queue is not None:
-                try:
-                    self._out_queue.put_nowait(frame)
-                except queue.Full:
-                    self.error = (
-                        "Queue overflow: disk too slow — PLSQ recording stopped."
-                    )
-                    break
-            else:
-                self.frames.append(frame)
-            self.frames_captured += 1
-            if miss:
-                self.missing += 1
-            k += 1
-            self.elapsed = now - t0
-            if self.max_frames and k >= self.max_frames:
-                break
-
-
-def postprocess(frames, skip=0, blend=0, final=None):
-    """
-    Trim and loop-blend a recording.
-
-    skip   - number of first recorded frames to drop.
-    blend  - number of extra frames recorded after the final frame; the first `blend` frames of the
-             result fade from that continuation into the original frames, so the last frame flows into
-             the first one without a jump.
-    final  - number of frames in the result (default: everything that is left after skip and blend).
-    """
-    frames = frames[skip:]
-    if final is None:
-        final = len(frames) - blend
-    if final <= 0 or final + blend > len(frames):
-        raise ValueError(
-            "Not enough recorded frames: need %d, have %d"
-            % (max(final, 0) + blend + skip, len(frames) + skip)
-        )
-    if blend > final:
-        raise ValueError("Loop blend must not exceed the number of exported frames")
-    out = [bytearray(f) for f in frames[:final]]
-    for i in range(blend):
-        w = i / float(blend)
-        tail, head = frames[final + i], out[i]
-        for j in range(len(head)):
-            head[j] = int(round(tail[j] * (1.0 - w) + head[j] * w))
-    return [bytes(f) for f in out]
-
-
-def _blend_frames(tail_frames, head_frames):
-    """Blend tail into head: out[i] = round(tail[i]*(1-w) + head[i]*w), w = i/len."""
-    n = len(head_frames)
-    result = []
-    for i in range(n):
-        w = i / float(n)
-        t, h = tail_frames[i], head_frames[i]
-        out = bytearray(len(h))
-        for j in range(len(h)):
-            out[j] = int(round(t[j] * (1.0 - w) + h[j] * w))
-        result.append(bytes(out))
-    return result
-
-
-class PlsqStreamWriter:
-    """Consumes frames from a queue, writes them to a PlsqWriter (streaming .plsq).
-
-    Call start(q), then join() after the sampler sends the None sentinel.
-    After join(): check error; if None, frames_written and bytes_written are valid.
-    """
-
-    def __init__(self, writer, skip, blend, stride):
-        self._writer = writer
-        self._skip = skip
-        self._blend = blend
-        self._stride = stride
-        self.frames_written = 0
-        self.bytes_written = 0
-        self.error = None
-        self._thread = None
-
-    def start(self, q):
-        self._q = q
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def join(self, timeout=None):
-        if self._thread:
-            self._thread.join(timeout=timeout)
-
-    @property
-    def is_alive(self):
-        return self._thread is not None and self._thread.is_alive()
-
-    def _run(self):
-        try:
-            self._write_loop()
-        except Exception as exc:
-            self.error = str(exc)
-
-    def _write_loop(self):
-        skip_left = self._skip
-        blend = self._blend
-        delay = collections.deque()
-
-        while True:
-            try:
-                frame = self._q.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            self._q.task_done()
-
-            if frame is None:  # sentinel: sampler finished
-                break
-
-            if skip_left > 0:
-                skip_left -= 1
-                continue
-
-            if blend > 0:
-                delay.append(frame)
-                if len(delay) > blend:
-                    to_write = delay.popleft()
-                    self._writer.append_frame(to_write)
-                    self.frames_written += 1
-                    self.bytes_written += self._stride
-            else:
-                self._writer.append_frame(frame)
-                self.frames_written += 1
-                self.bytes_written += self._stride
-
-        # Apply loop blend: rewrite the first min(blend, frames_written) frames
-        tail = list(delay)
-        if blend > 0 and tail and self.frames_written > 0:
-            actual_blend = min(blend, len(tail), self.frames_written)
-            t_start = time.perf_counter()
-            head = self._writer.read_frames(0, actual_blend)
-            blended = _blend_frames(tail[:actual_blend], head)
-            elapsed = time.perf_counter() - t_start
-            if elapsed > 10.0:
-                self.error = (
-                    "Loop blend took %.1f s (> 10 s limit). "
-                    "Consider reducing blend length or chip count." % elapsed
-                )
-                return
-            self._writer.rewrite_frames(0, blended)
-
-
-_LUT = [json.dumps(round(i / 255.0, 3)) for i in range(256)]  # 0 -> "0.0", 255 -> "1.0"
-
-
-def write_json(path, meta, frames):
-    """Write a JSON sequence file.
-
-    meta must be the 27-key dict returned by build_meta() with file_format="json".
-    Raises ValueError when universes_count > 2 (D3: JSON only for small installs).
-    """
-    n_uni = int(meta["input_mapping_universes_count"])
-    if n_uni > 2:
-        raise ValueError(
-            "JSON export is not available for 3 or more universes (got %d). "
-            "Use PLSQ format instead." % n_uni
-        )
-    lines = ["{"]
-    for k, v in meta.items():
-        lines.append(
-            "  %s: %s,"
-            % (json.dumps(k, ensure_ascii=False), json.dumps(v, ensure_ascii=False))
-        )
-    lines.append('  "sequence": {')
-    lines.append('    "data": [')
-    rows = [", ".join(_LUT[b] for b in fr) for fr in frames]
-    lines.append(",\n".join("      " + r for r in rows))
-    lines.append("    ]")
-    lines.append("  }")
-    lines.append("}")
-    folder = os.path.dirname(os.path.abspath(path))
-    os.makedirs(folder, exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="\n") as fp:
-        fp.write("\n".join(lines) + "\n")
-    return os.path.getsize(path)
-
-
-def path_key(path):
-    """Normalized form of a path, for comparing two paths."""
-    return os.path.normcase(os.path.abspath(path))
-
-
-def next_free_path(path):
-    """sequence_1.json -> sequence_2.json (first name that does not exist yet)."""
-    folder, name = os.path.split(path)
-    stem, ext = os.path.splitext(name)
-    m = re.match(r"^(.*?)(\d+)$", stem)
-    if m:
-        base, num, width = m.group(1), int(m.group(2)), len(m.group(2))
-    else:
-        base, num, width = stem + "_", 0, 1
-    while True:
-        num += 1
-        cand = os.path.join(folder, "%s%s%s" % (base, str(num).zfill(width), ext))
-        if not os.path.exists(cand):
-            return cand
 
 
 # ----------------------------------------------------------------------------
@@ -699,18 +155,18 @@ class App(tk.Tk if tk else object):
             value="30"
         )
         self.last_saved = ""
-        self.errors = []  # [(time, message)] shown in the statistics block
-        self.saved_path = None  # file written by the last successful save
-        self.pending = None  # finished recording that has not been saved yet (JSON)
-        self._approved = None  # path key the user agreed to overwrite
+        self.errors = []  # [(time, message)]
+        self.saved_path = None
+        self.pending = None
+        self._approved = None
         self._was_recording = False
-        self._job = None  # settings of the current recording (target frames, skip, blend)
+        self._job = None
         # PLSQ streaming state
-        self._plsq_sw = None      # PlsqStreamWriter | None
-        self._plsq_writer = None  # PlsqWriter | None
-        self._plsq_queue = None   # queue.Queue | None
-        self._plsq_part = None    # path to .part file
-        self._plsq_target = None  # final target path
+        self._plsq_sw = None
+        self._plsq_writer = None
+        self._plsq_queue = None
+        self._plsq_part = None
+        self._plsq_target = None
         self._prev = (time.perf_counter(), 0, {})
         self._rates = (0.0, {})
         self._build()
@@ -1193,6 +649,9 @@ class App(tk.Tk if tk else object):
             sw = PlsqStreamWriter(pw, skip, blend, stride)
             sw.start(out_queue)
             self._plsq_sw = sw
+        # I-03: snapshot lost_packets at recording start so pre-recording losses
+        # don't appear in the file meta.
+        self._lost_packets_start = self.server.snapshot()[6]
         self.rec.start(
             spans,
             stride,
@@ -1212,7 +671,7 @@ class App(tk.Tk if tk else object):
         _, ustats, _, _, _, _, _, _ = self.server.snapshot()
         received = set(ustats.keys())
         if not received:
-            return True, []   # nothing yet → wait mode, fine
+            return True, []
         missing = expected - received
         if missing:
             return False, [
@@ -1280,7 +739,7 @@ class App(tk.Tk if tk else object):
                 new = self._choose_new_path(path)
                 if new:
                     return new
-                continue  # the save dialog was cancelled: ask again
+                continue
             return None
 
     def _confirm_can_record(self):
@@ -1316,16 +775,16 @@ class App(tk.Tk if tk else object):
         return True
 
     def _finish_recording(self):
-        self.server.set_assembler(None)   # detach assembler now that recording ended
+        self.server.set_assembler(None)
         self._was_recording = False
         self._update_buttons()
         job = self._job
         fps = self.rec.fps
-        # Capture stats from the recorder/server before anything can reset them
         rec_missing = self.rec.missing
         rec_late = self.rec.late
         rec_partial = self.rec.partial_source_frames
-        _, _, _, _, _, _, lost_pkts, _ = self.server.snapshot()
+        _, _, _, _, _, _, _lost_total, _ = self.server.snapshot()
+        lost_pkts = max(0, _lost_total - getattr(self, "_lost_packets_start", 0))
         mapping_fields = {
             "start_universe": job["start_universe"],
             "start_channel": job["start_channel"],
@@ -1352,7 +811,6 @@ class App(tk.Tk if tk else object):
         part = self._plsq_part
         target = self._plsq_target
 
-        # Send sentinel so the writer thread knows the sampler is done
         q = self._plsq_queue
         if q is not None:
             try:
@@ -1363,7 +821,6 @@ class App(tk.Tk if tk else object):
         if sw is not None:
             sw.join(timeout=30.0)
 
-        # Clean up state references
         self._plsq_sw = None
         self._plsq_writer = None
         self._plsq_part = None
@@ -1391,7 +848,6 @@ class App(tk.Tk if tk else object):
                 pass
             return
 
-        # Finalize the writer: write meta, set FINALIZED flag
         blend_applied = min(job["blend"], final) if job["blend"] else 0
         meta = build_meta(
             file_format="plsq",
@@ -1455,7 +911,6 @@ class App(tk.Tk if tk else object):
         try:
             frames = postprocess(raw, job["skip"], job["blend"], final)
         except ValueError as e:
-            # keep the raw recording so that nothing is lost
             self.pending = dict(base, frames=list(raw), skip=0, blend=0,
                                 **mapping_fields, **stats_fields)
             self._err("Post-processing failed: %s" % e)
@@ -1594,16 +1049,15 @@ class App(tk.Tk if tk else object):
         if self.rec.error:
             self._err(self.rec.error)
             self.rec.error = None
-        # If the PLSQ writer failed (e.g. disk full), stop the recording
         if self._plsq_sw is not None and self._plsq_sw.error:
             self._err("PLSQ writer: %s" % self._plsq_sw.error)
             if self.rec.state in ("waiting", "recording"):
                 self.rec.stop()
         if not self.server.running and self.rec.state in ("waiting", "recording"):
-            self.rec.stop()  # the source is gone: finish what has been recorded
+            self.rec.stop()
         if self._was_recording and self.rec.state == "done":
             self._finish_recording()
-        # Live derived fields — always update (also during recording)
+        # Live derived fields
         try:
             chips = int(self.vars["model_chips_count"].get())
             cpc = int(self.map_vars["channels_per_chip"].get())
@@ -1628,7 +1082,7 @@ class App(tk.Tk if tk else object):
         except (ValueError, ZeroDivisionError):
             self.universes_var.set("?")
             self.eff_cpu_var.set("")
-        # JSON format: disable radio when 3+ universes, force back to plsq if needed
+        # JSON format: disable radio when 3+ universes
         try:
             n_uni_str = self.universes_var.get()
             if n_uni_str and n_uni_str != "?":
@@ -1676,7 +1130,6 @@ class App(tk.Tk if tk else object):
                             None,
                         ))
                 else:
-                    # Compact summary for large installations
                     u_min, u_max = unis[0], unis[-1]
                     rates_list = [urates.get(u, 0.0) for u in unis]
                     lengths = [ustats[u]["length"] for u in unis]
