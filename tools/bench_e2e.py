@@ -250,6 +250,59 @@ def _build_ring(chips, stride, fps):
     return frames
 
 
+def _describe_torn(idx, frame, ring, spans):
+    """Diagnostics for one torn frame: nearest ring frame, first differing
+    byte, the universes involved and which ring frame the differing universes
+    match instead. Returns a list of log lines."""
+    def ndiff(a, b):
+        return sum(1 for x, y in zip(a, b) if x != y)
+
+    def uni_of(offset):
+        for uni, _ch, n_ch, off in spans:
+            if off <= offset < off + n_ch:
+                return uni, offset - off
+        return None, None
+
+    dists = [ndiff(frame, r) for r in ring]
+    k = min(range(len(ring)), key=dists.__getitem__)
+    near = ring[k]
+    diff_pos = [i for i, (x, y) in enumerate(zip(frame, near)) if x != y]
+    lines = ["First torn frame: #%d (len %d)" % (idx, len(frame))]
+    if not diff_pos:
+        lines.append("  identical to ring[%d]?" % k)
+        return lines
+    first = diff_pos[0]
+    u, u_off = uni_of(first)
+    lines.append(
+        "  nearest ring frame: ring[%d], %d differing bytes (of %d)"
+        % (k, len(diff_pos), len(frame))
+    )
+    lines.append(
+        "  first differing byte: %d (universe U%s, byte %s in universe), "
+        "got %d expected %d" % (first, u, u_off, frame[first], near[first])
+    )
+    unis = []
+    for pos in diff_pos:
+        uu, _ = uni_of(pos)
+        if not unis or unis[-1] != uu:
+            unis.append(uu)
+    lines.append(
+        "  differing bytes %d..%d, universes involved: %s"
+        % (diff_pos[0], diff_pos[-1], ",".join("U%s" % x for x in unis[:20])
+           + (" ..." if len(unis) > 20 else ""))
+    )
+    for uu in unis[:5]:
+        span = next(sp for sp in spans if sp[0] == uu)
+        _uni, _ch, n_ch, off = span
+        part = frame[off:off + n_ch]
+        match = [j for j, r in enumerate(ring) if r[off:off + n_ch] == part]
+        lines.append(
+            "  U%s (frame bytes %d..%d): matches ring%s"
+            % (uu, off, off + n_ch - 1, match[:6] if match else " frame: none")
+        )
+    return lines
+
+
 # ---- queue depth tracker ---------------------------------------------------
 
 def _track_q(q_ref, result, stop_ev):
@@ -478,11 +531,19 @@ def run_one(chips, fps, duration, out_dir, complete_frames=True,
             ring = _build_ring(chips, stride, fps)
             ring_set = set(ring)
             zero_frame = bytes(stride)
-            for f in rec_frames:
+            first_torn = None
+            for i, f in enumerate(rec_frames):
                 if f == zero_frame:
                     zero += 1
                 elif f not in ring_set:
                     torn += 1
+                    if first_torn is None:
+                        first_torn = i
+            if first_torn is not None:
+                for line in _describe_torn(
+                    first_torn, rec_frames[first_torn], ring, spans
+                ):
+                    _log(line)
         except Exception as exc:
             _log("Content check failed: %s" % exc)
 
