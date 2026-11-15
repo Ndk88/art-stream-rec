@@ -292,7 +292,7 @@ def main(argv=None):
         _log("ArtSync: enabled (OpCode 0x5200 after each frame)")
     if args.stagger_ms > 0:
         frame_ms = 1000.0 / fps
-        _log("Stagger: %.2f ms/uni × %d uni = %.1f ms/frame (frame = %.1f ms)"
+        _log("Stagger: %.2f ms/uni x %d uni = %.1f ms/frame (frame = %.1f ms)"
              % (args.stagger_ms, universes_count, stagger_total_ms, frame_ms))
         if stagger_total_ms > frame_ms:
             _log("WARNING: stagger total %.1f ms > frame %.1f ms — sender will lag"

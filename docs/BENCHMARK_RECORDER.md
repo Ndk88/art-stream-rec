@@ -131,3 +131,47 @@ python tools/bench_receiver.py --matrix --duration 10
 # Full matrix (60 s each, ~6 min)
 python tools/bench_receiver.py --matrix --duration 60
 ```
+
+---
+
+## End-to-end baseline (pre-I-02..I-11, 2026-11-15, 10 s each)
+
+Measured with `tools/bench_e2e.py --quick --no-content-check` on `dev/v1.2.0` immediately after I-01 (session.py extraction + bench_e2e creation).  Unlike `bench_receiver.py`, this tool runs the full pipeline: `ArtNetServer → FrameAssembler → Recorder → PlsqStreamWriter` with an atomic-rename finalize; results are PLSQ files validated by `plsq.validate()`.
+
+| Label | chips | fps | lost | late % | missing % | torn | zero | validate |
+|-------|------:|----:|-----:|-------:|----------:|-----:|-----:|----------|
+| 1700/30 | 1,700 | 30 | 0 | 0.00 % | 0.33 % (1 f) | 0 | 0 | OK |
+| 1700/60 | 1,700 | 60 | 0 | 0.00 % | 0.17 % (1 f) | 0 | 0 | OK |
+| 10000/60 | 10,000 | 60 | 0 | 0.00 % | 0.17 % (1 f) | 0 | 0 | OK |
+| 32000/60 | 32,000 | 60 | 0 | 0.00 % | 0.17 % (1 f) | 0 | 0 | OK |
+| 64000/30 | 64,000 | 30 | 0 | 0.00 % | 0.33 % (1 f) | 0 | 0 | OK |
+| **64000/60** | **64,000** | **60** | **0** | **0.00 %** | **0.17 % (1 f)** | **0** | **0** | **OK** |
+| 64k/60 +artsync+stagger | 64,000 | 60 | 0 | 0.00 % | 0.83 % (5 f) | 0 | 0 | OK |
+| 64k/60 no-assembler | 64,000 | 60 | 0 | 0.00 % | 0.00 % | 0 | 0 | OK |
+
+**Queue**: never exceeded 1 frame / 300 capacity at any matrix point.
+
+**Known pre-fix issues visible in this baseline:**
+
+| Issue | Effect in table |
+|-------|----------------|
+| I-02: first-frame race | 1 missing/zero frame at every size (FrameAssembler not yet seeded before Recorder starts sampling) |
+| artsync+stagger had extra missing frames | 5 missing frames at 64k/60; root cause under investigation |
+
+**Acceptance targets (64,000 chips / 60 fps):**
+
+| Target | Result | Status |
+|--------|--------|--------|
+| Zero lost packets | 0 | ✓ PASS |
+| `late_frames` below 0.5 % | 0.00 % | ✓ PASS |
+| Zero torn frames | 0 | ✓ PASS |
+| File validates | OK | ✓ PASS |
+
+All R8 acceptance targets are met by the pre-I-02 code on this hardware.  The 1-frame missing/zero issue will be fixed by I-02 (seed the assembler before starting the Recorder).
+
+```
+# Reproduce this baseline
+python tools/bench_e2e.py --quick --no-content-check
+# Single point with content check
+python tools/bench_e2e.py --chips 64000 --fps 60 --duration 10
+```

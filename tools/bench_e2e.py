@@ -137,9 +137,17 @@ def _drive_free_gb(path):
 # ---- tester subprocess helpers ---------------------------------------------
 
 def _parse_sent(text):
-    """Parse total sent packets from packets_tester final line."""
+    """Parse total sent packets from tester output.
+
+    Prefers the 'Stopped … sent N packets' final line; falls back to the
+    maximum 'total N' seen in periodic stat lines (accurate for single-process;
+    per-process only for multi-process runs — multiply by proc count yourself).
+    """
     m = re.search(r"sent (\d+) packets", text)
-    return int(m.group(1)) if m else None
+    if m:
+        return int(m.group(1))
+    totals = [int(v) for v in re.findall(r"\| total (\d+) \|", text)]
+    return max(totals) if totals else None
 
 
 def _start_tester(chips, fps, duration, artsync, stagger_ms, n_uni):
