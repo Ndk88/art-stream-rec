@@ -59,6 +59,21 @@ After the reset:
 
 The reset is applied in both `PlsqRecordingSession.start()` (session.py) and `App._toggle_record()` (main.py).
 
+### When the baseline is taken (added in the final pass, A2/C3)
+
+The `lost_packets` baseline and the `_seq_last` reset happen **when recording is started**: when the user presses
+Record (`App._toggle_record()`, JSON path) or when `PlsqRecordingSession.start()` is called (PLSQ path, also called
+from `_toggle_record()`). They are **not** taken when the sampling clock starts. With "Start recording on first
+packet" on, `Recorder._capture()` first waits for the first assembled frame (`committed_frame is not None`) and only
+then sets its clock `t0`. Sequence gaps detected between pressing Record and that first assembled frame are counted
+in the file's `lost_packets`, although no frame of the file was sampled in that interval.
+
+Since the final pass (commit `bd2513e`) both paths call the same two functions in `session.py`:
+`start_loss_tracking(server)` (reset + baseline, at start) and `recording_lost_packets(server, baseline)` (at the
+end). `tests/test_i02_i03.py` calls these functions directly, and
+`TestLostPacketsRealServer.test_gap_before_start_excluded_gap_after_counted` checks the behavior over real UDP with a
+real `ArtNetServer`: a gap before `start()` is not in the file's `lost_packets`, a gap after `start()` is.
+
 ---
 
 ## Tests
@@ -69,10 +84,11 @@ The reset is applied in both `PlsqRecordingSession.start()` (session.py) and `Ap
 |------|--------|
 | `test_plsq_pre_recording_losses_excluded` | Pre-seeded `server.lost_packets = 100`; no additional losses during recording; `result()["lost_packets"] == 0`; file meta `int("lost_packets") == 0` |
 | `test_plsq_in_recording_losses_counted` | Pre-seeded 100; +5 injected after `start()`; `result()["lost_packets"] == 5` |
-| `test_json_pre_recording_losses_excluded` | Calls `build_meta` directly with `lost_packets = max(0, (50+3) - 50) = 3`; `int(doc["lost_packets"]) == 3` |
+| `test_json_pre_recording_losses_excluded` | Original version: called `build_meta` directly with a value the test computed itself (`max(0, (50+3) - 50)`), so no application code was checked. **Rewritten in the final pass (A2):** drives `start_loss_tracking` / `recording_lost_packets`, the same functions the JSON path of `main.py` uses. |
+| `TestLostPacketsRealServer.test_gap_before_start_excluded_gap_after_counted` | Added in the final pass (A2): real `ArtNetServer` over UDP + `PlsqRecordingSession`; gap of 3 before start and a seq jump across the start are excluded, gap of 2 after start is in the file meta. |
 
 Command: `python -m unittest tests.test_i02_i03 -v`  
-Result: 7 tests, all pass.
+Result (session #2): 7 tests, all pass. Result after the final pass: 8 tests, all pass.
 
 ---
 
@@ -81,6 +97,11 @@ Result: 7 tests, all pass.
 1. **main.py fix not covered by automated test.** The `App._toggle_record → _finish_recording` flow requires the full Tkinter GUI and cannot be exercised in a unit test without a display. The fix was verified by code review only. This path will be replaced by `PlsqRecordingSession` in I-08, at which point the session.py tests cover it directly.
 
 2. **_seq_last reset in main.py not independently tested.** The reset was added alongside the baseline snapshot in both files. Its effect would only be observable if a sender restarts (sequence resets to 1) between pre-recording and recording phases, which is not covered by the current test suite.
+
+**Update (final pass):** the calculation is now shared (`start_loss_tracking` / `recording_lost_packets`), so the
+functions used by `main.py` are tested; the Tkinter call sites themselves are still not tested. The `_seq_last` reset
+is covered by the real-UDP integration test on the `PlsqRecordingSession` path (seq jump 6 → 20 across the start is
+not counted).
 
 ---
 
