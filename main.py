@@ -29,7 +29,7 @@ from session import (
     path_key, next_free_path,
     ArtNetServer, FrameAssembler, Recorder, PlsqStreamWriter,
     PlsqRecordingSession,
-    start_loss_tracking, recording_lost_packets,
+    start_loss_tracking, recording_lost_packets, short_packets_warning,
 )
 
 APPV = "1.2.1"
@@ -164,6 +164,7 @@ class App(tk.Tk if tk else object):
         self._job = None
         self._plsq_session = None   # active PlsqRecordingSession (PLSQ only)
         self._blend_warn = None     # D11 warning, cleared on new recording
+        self._short_warn = None     # I-10 warning of the last PLSQ recording
         self._prev = (time.perf_counter(), 0, {})
         self._rates = (0.0, {})
         self._build()
@@ -668,6 +669,7 @@ class App(tk.Tk if tk else object):
                 return
         self._clear_errors()
         self._blend_warn = None
+        self._short_warn = None
         self.vars["sequence_frame_stride"].set(str(stride))
         if is_plsq:
             # I-08: delegate PLSQ recording lifecycle to PlsqRecordingSession
@@ -875,6 +877,9 @@ class App(tk.Tk if tk else object):
         res = sess.result()
         if res.get("blend_warning"):
             self._blend_warn = res["blend_warning"]
+        self._short_warn = short_packets_warning(
+            res.get("short_packets", 0), res.get("first_short_uni")
+        )
         try:
             size = os.path.getsize(res["path"])
         except OSError:
@@ -1283,6 +1288,15 @@ class App(tk.Tk if tk else object):
                         "Warning: some frames had no data for a universe from Input mapping.",
                         "warn",
                     ))
+
+        # I-10: short packets (live from the assembler, else the last PLSQ result)
+        asm = sess.assembler if sess is not None else self.rec._assembler
+        if asm is not None:
+            short_line = short_packets_warning(asm.short_packets, asm.first_short_uni)
+        else:
+            short_line = self._short_warn
+        if short_line:
+            L.append((short_line, "warn"))
 
         if self.last_saved:
             L.append(("", None))

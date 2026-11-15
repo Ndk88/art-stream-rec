@@ -131,6 +131,19 @@ class FrameAssembler:
             self.partial_count += 1
 
 
+def short_packets_warning(short_packets, first_universe):
+    """Statistics line for I-10 short packets, or None when there are none.
+
+    A short packet carries fewer DMX channels than the input mapping expects
+    for its universe; the missing channels are recorded as 0.
+    """
+    if not short_packets:
+        return None
+    if first_universe is None:
+        return "short packets: %d" % short_packets
+    return "short packets: %d (first universe %d)" % (short_packets, first_universe)
+
+
 # ----------------------------------------------------------------------------
 #  ArtNetServer
 # ----------------------------------------------------------------------------
@@ -695,6 +708,10 @@ class PlsqRecordingSession:
         return self._recorder
 
     @property
+    def assembler(self):
+        return self._assembler
+
+    @property
     def queue_size(self):
         return self._queue.qsize() if self._queue is not None else 0
 
@@ -880,6 +897,7 @@ class PlsqRecordingSession:
         )
 
         rec = self._recorder
+        asm = self._assembler
         meta_kw = dict(self._meta_extra)
         meta = build_meta(
             file_format="plsq",
@@ -929,6 +947,8 @@ class PlsqRecordingSession:
             "late_frames": rec.late if rec else 0,
             "partial_source_frames": rec.partial_source_frames if rec else 0,
             "frames_captured": rec.frames_captured if rec else final,
+            "short_packets": asm.short_packets if asm else 0,
+            "first_short_uni": asm.first_short_uni if asm else None,
         }
         self.state = "done"
 
