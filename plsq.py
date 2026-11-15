@@ -125,6 +125,11 @@ def _encode_meta(meta_dict):
     return json.dumps(meta_dict, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
+def encoded_meta_size(meta_dict):
+    """Return byte length of meta_dict as PLSQ JSON (UTF-8, compact separators)."""
+    return len(_encode_meta(meta_dict))
+
+
 def _decode_meta(data):
     try:
         obj = json.loads(data.decode("utf-8"))
