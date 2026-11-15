@@ -21,12 +21,12 @@ Options:
   --skip N           Skip first N frames.
   --blend N          Loop-blend N frames.
   --out-dir DIR      Where to write .plsq files (default: system temp).
-
-recv % = packets counted by ArtNetServer over the whole run / packets sent by
-all tester processes (sum of each process's final count). n/a if unparseable.
   --matrix           Run all 6 standard matrix points + 2 extra runs.
   --quick            Use 10 s instead of --duration for each run.
   --no-content-check Skip per-frame content validation (fast path for large chips).
+
+recv % = packets counted by ArtNetServer over the whole run / packets sent by
+all tester processes (sum of each process's final count). n/a if unparseable.
 """
 
 import argparse
@@ -72,8 +72,19 @@ try:
             ("PrivateUsage",                ctypes.c_size_t),
         ]
 
-    _psapi   = ctypes.windll.psapi
-    _k32     = ctypes.windll.kernel32
+    # Own WinDLL instances with explicit prototypes: with the ctypes defaults
+    # the pseudo-handle returned by GetCurrentProcess() (-1) is truncated to a
+    # 32-bit int, both calls fail silently and CPU/memory read as 0.
+    _psapi   = ctypes.WinDLL("psapi")
+    _k32     = ctypes.WinDLL("kernel32")
+    _k32.GetCurrentProcess.restype = _wt.HANDLE
+    _k32.GetCurrentProcess.argtypes = []
+    _k32.GetProcessTimes.restype = _wt.BOOL
+    _k32.GetProcessTimes.argtypes = [_wt.HANDLE] + [ctypes.POINTER(_wt.FILETIME)] * 4
+    _psapi.GetProcessMemoryInfo.restype = _wt.BOOL
+    _psapi.GetProcessMemoryInfo.argtypes = [
+        _wt.HANDLE, ctypes.POINTER(_PMCE), _wt.DWORD
+    ]
     _HAS_WIN = True
 except (AttributeError, OSError, ImportError):
     _HAS_WIN = False
