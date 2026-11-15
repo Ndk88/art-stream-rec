@@ -58,7 +58,15 @@ End-to-end benchmark: `ArtNetServer → FrameAssembler → Recorder → PlsqStre
 
 **Symptom:** `bench_e2e --quick` hung at "waiting frames=0".
 
-**Root cause:** Three bugs in the original `bench_e2e.py`:
+**Correction (final pass, C4):** the original cause of the hang, i.e. why the server received **0 packets** in that
+run, was **not established**. It was not reproduced afterwards and no measurement links it to any of the items
+below. What was done is diagnostics and timeouts only: the bench now shows the tester output live, detects a tester
+that exits early, aborts after 5 s without packets and says so. If the "0 packets" case happens again, this output
+is what should be used to find the cause. The list below is therefore "defects that made the hang invisible and
+endless", not a root cause. The sentence "The underlying recording pipeline was not broken" further down is based
+on separate manual runs and is not a proof.
+
+**Defects in the original `bench_e2e.py`** (previously titled "Root cause: three bugs"):
 1. **No timeout** in the poll loop — if the recorder stayed in "waiting" state for any reason, the loop ran forever.
 2. **Silent tester** — `stdout=subprocess.PIPE` captured all output; nothing was displayed until after the process exited. Failures were invisible.
 3. **No early-exit detection** — if `packets_tester.py` crashed, `bench_e2e` did not notice and kept polling.
@@ -85,6 +93,13 @@ The underlying recording pipeline was not broken (confirmed by separate diagnost
 **Fix (commit `c141c8e`):** fallback to `max(| total N |)` from periodic per-second stats. For single-process runs this gives the correct last cumulative total. For multi-process runs (each subprocess logs its own total), it gives the total from one process — multiply by number of processes mentally.
 
 The tester periodic line format: `sent N (R pkt/s x U uni) | total T |` — `T` is the cumulative total for that subprocess. The "Stopped. Main process sent X packets" line never appears because `_stop_tester` terminates the process.
+
+**Superseded in the final pass (A1, commit `d85c145`).** The fallback above was wrong in two ways: worker
+processes printed nothing, so at more than 125 universes only the main process (1/4 of the universes) was counted
+and "recv %" came out at 416-418 %; and on small points the last periodic total is lower than the real total, which
+gave 101-102 %. Now the workers report their counts to the main process, the tester prints a final line per
+process, `bench_e2e` waits for the tester to finish and sums the final values of all processes (last periodic total
+as fallback, `n/a` if not parseable). Verified at 10000/60 and 64000/60: 100.00 % (see REPORT_FINAL.md).
 
 ---
 
