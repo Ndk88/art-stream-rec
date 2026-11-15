@@ -170,7 +170,29 @@ class TestFrameAssemblerTwoUniverses(unittest.TestCase):
         self.assertIsNone(self.fa.committed_frame)
         self.fa.on_artsync()
         self.assertIsNotNone(self.fa.committed_frame)
-        # ArtSync commit is NOT counted as partial
+        # ArtSync with only a subset of universes is a partial commit (I-09 fix)
+        self.assertEqual(self.fa.partial_count, 1)
+
+    def test_artsync_full_not_partial(self):
+        """ArtSync when all universes have already arrived → committed_frame unchanged, no partial."""
+        _deliver(self.fa, self.u0, self._data0())
+        _deliver(self.fa, self.u1, self._data1())
+        # on_universe for u1 triggered a full commit (_updated == _expected)
+        frame_before = self.fa.committed_frame
+        self.assertIsNotNone(frame_before)
+        self.assertEqual(self.fa.partial_count, 0)
+        # on_artsync with no pending updates (_updated is empty) → no commit
+        self.fa.on_artsync()
+        self.assertIs(self.fa.committed_frame, frame_before)
+        self.assertEqual(self.fa.partial_count, 0)
+
+    def test_artsync_case_c_all_universes_arrive_before_sync(self):
+        """Case (c): ArtSync fires after every complete frame; partial_count stays 0."""
+        for _ in range(5):
+            _deliver(self.fa, self.u0, self._data0())
+            _deliver(self.fa, self.u1, self._data1())
+            # Full commit already happened; ArtSync with empty _updated is a no-op
+            self.fa.on_artsync()
         self.assertEqual(self.fa.partial_count, 0)
 
     def test_repeat_universe_causes_partial(self):

@@ -66,6 +66,8 @@ class FrameAssembler:
         self.enabled = True
         self.committed_frame = None   # bytes | None; read by sampler thread
         self.partial_count = 0        # partial commits (repeat-universe or ArtSync with partial data)
+        self.short_packets = 0        # packets that covered fewer channels than mapped
+        self.first_short_uni = None   # port_address of first short packet (for stats warning)
         self._working = None          # bytearray; written only by the receive thread
         self._expected = frozenset()  # universes that must all arrive for a full commit
         self._updated = set()         # universes updated since last commit
@@ -79,6 +81,8 @@ class FrameAssembler:
         self._updated = set()
         self.committed_frame = None
         self.partial_count = 0
+        self.short_packets = 0
+        self.first_short_uni = None
 
     def on_universe(self, port_address, mv, pkt_len, dmx_len):
         """
@@ -97,8 +101,18 @@ class FrameAssembler:
 
         src_start = 18 + ch
         src_end = src_start + n_ch
-        if src_end <= 18 + dmx_len:
+        pkt_end = 18 + dmx_len
+        if src_end <= pkt_end:
             self._working[off:off + n_ch] = mv[src_start:src_end]
+        else:
+            # Short packet: copy available bytes, zero-fill the rest
+            avail = max(0, pkt_end - src_start)
+            if avail > 0:
+                self._working[off:off + avail] = mv[src_start:src_start + avail]
+            self._working[off + avail:off + n_ch] = bytes(n_ch - avail)
+            self.short_packets += 1
+            if self.first_short_uni is None:
+                self.first_short_uni = port_address
         self._updated.add(port_address)
 
         if self._updated >= self._expected:
@@ -108,7 +122,7 @@ class FrameAssembler:
         """Force a commit on ArtSync if at least one universe arrived."""
         if not self.enabled or not self._updated:
             return
-        self._commit(partial=False)
+        self._commit(partial=(self._updated < self._expected))
 
     def _commit(self, partial):
         self.committed_frame = bytes(self._working)
