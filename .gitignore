@@ -1,2 +1,5 @@
+__pycache__/
 *.json
-README_RU.md
+*.plsq
+*.part
+!tests/golden/conformance_v1.plsq

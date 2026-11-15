@@ -4,8 +4,8 @@ rem ---------------------------------------------------------------
 rem  Launcher for packets_tester.py (test Art-Net source with a log)
 rem  The console stays open so you can read the sending log and errors.
 rem
-rem  Usage:    run_packets_tester.bat [host] [port] [chips] [universe]
-rem  Example:  run_packets_tester.bat 127.0.0.1 6454 104 1
+rem  Usage:    packets_tester.bat [host] [port] [chips] [universe]
+rem  Example:  packets_tester.bat 127.0.0.1 6454 104 1
 rem  Defaults: 127.0.0.1  6454  104  1
 rem  Stop with Ctrl+C. Keep this file in the same folder as packets_tester.py
 rem ---------------------------------------------------------------

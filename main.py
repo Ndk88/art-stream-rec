@@ -10,10 +10,13 @@ Run:      python main.py        (Python 3.9+, no extra packages)
 Build:    pyinstaller --onefile --noconsole main.py
 """
 
+import collections
 import json
 import os
+import queue
 import re
 import socket
+import struct
 import threading
 import time
 
@@ -23,9 +26,14 @@ try:
 except ImportError:  # the core can still be imported without tkinter (for tests)
     tk = None
 
-APPV = "1.0.0"
+from mapping import build_spans, effective_chips_per_universe
+from plsq import PlsqWriter, build_meta
+
+APPV = "1.2.0"
 ARTNET_ID = b"Art-Net\x00"
-OP_DMX = 0x5000
+OP_DMX  = 0x5000
+OP_SYNC = 0x5200
+RCVBUF_SIZE = 32 * 1024 * 1024   # 32 MiB requested; kernel may cap on Windows
 
 
 # ----------------------------------------------------------------------------
@@ -42,26 +50,106 @@ def parse_artdmx(data):
     return port_address, data[12], bytes(data[18 : 18 + length])
 
 
+class FrameAssembler:
+    """
+    Anti-tearing frame assembler for multi-universe sources.
+
+    Groups incoming per-universe packets into complete source frames.
+    Commits a new `committed_frame` (immutable bytes) when:
+      (a) all mapped universes have been updated since the last commit, or
+      (b) an ArtSync packet (OpCode 0x5200) arrives, or
+      (c) a mapped universe arrives a second time before all others: commit the
+          partial working frame and start a new one with the duplicate as the
+          first update (counted in `partial_count`).
+
+    `committed_frame` is replaced by a plain reference swap, which is atomic
+    under CPython's GIL; the sampler thread reads it without a lock.
+
+    When `enabled` is False the assembler is a no-op; callers fall back to the
+    old sample-the-latest behavior.
+    """
+
+    def __init__(self):
+        self.enabled = True
+        self.committed_frame = None   # bytes | None; read by sampler thread
+        self.partial_count = 0        # partial commits (repeat-universe or ArtSync with partial data)
+        self._working = None          # bytearray; written only by the receive thread
+        self._expected = frozenset()  # universes that must all arrive for a full commit
+        self._updated = set()         # universes updated since last commit
+        self._spans_by_uni = {}       # port_address -> (ch_start, n_channels, frame_offset)
+
+    def start(self, spans, stride):
+        """Configure for a new recording. Must be called before the server begins
+        calling on_universe()."""
+        self._spans_by_uni = {uni: (ch, n, off) for uni, ch, n, off in spans}
+        self._expected = frozenset(self._spans_by_uni)
+        self._working = bytearray(stride)
+        self._updated = set()
+        self.committed_frame = None
+        self.partial_count = 0
+
+    def on_universe(self, port_address, mv, pkt_len, dmx_len):
+        """
+        Called from the receive thread for each valid ArtDMX packet.
+        mv is a memoryview of the full receive buffer; payload starts at byte 18.
+        """
+        if not self.enabled:
+            return
+        span = self._spans_by_uni.get(port_address)
+        if span is None:
+            return
+        ch, n_ch, off = span
+
+        if port_address in self._updated:
+            # Universe repeated before all mapped universes arrived → partial commit
+            self._commit(partial=True)
+
+        src_start = 18 + ch
+        src_end = src_start + n_ch
+        if src_end <= 18 + dmx_len:
+            self._working[off:off + n_ch] = mv[src_start:src_end]
+        self._updated.add(port_address)
+
+        if self._updated >= self._expected:
+            self._commit(partial=False)
+
+    def on_artsync(self):
+        """Force a commit on ArtSync if at least one universe arrived."""
+        if not self.enabled or not self._updated:
+            return
+        self._commit(partial=False)
+
+    def _commit(self, partial):
+        self.committed_frame = bytes(self._working)  # atomic reference swap under GIL
+        self._updated = set()
+        if partial:
+            self.partial_count += 1
+
+
 class ArtNetServer:
     def __init__(self):
         self.lock = threading.Lock()
-        self.latest = {}  # port_address -> bytes(512), most recent data
-        self.uni_stats = {}  # port_address -> {"count": int, "length": int}
+        self.latest = {}      # port_address -> bytes(512), most recent data
+        self.uni_stats = {}   # port_address -> {"count": int, "length": int}
         self.total_packets = 0
         self.ignored_packets = 0
         self.total_bytes = 0
         self.last_packet_time = 0.0
+        self.lost_packets = 0   # approximate sequence-gap count
+        self.rcvbuf_actual = 0  # actual SO_RCVBUF reported by the kernel
         self.running = False
-        self.error = None  # set when the socket fails while the server is running
+        self.error = None
         self.host = ""
         self.port = 0
         self._sock = None
         self._thread = None
+        self._assembler = None          # FrameAssembler | None
+        self._seq_last = {}             # port_address -> last seq byte (1..255)
 
     def start(self, host, port):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            sock.bind((host, port))  # raises OSError if the port is taken
+            sock.bind((host, port))
         except OSError:
             sock.close()
             raise
@@ -71,6 +159,9 @@ class ArtNetServer:
             self.uni_stats.clear()
             self.total_packets = self.ignored_packets = self.total_bytes = 0
             self.last_packet_time = 0.0
+            self.lost_packets = 0
+            self.rcvbuf_actual = 0
+        self._seq_last.clear()
         self.error = None
         self._sock, self.host, self.port, self.running = sock, host, port, True
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -84,32 +175,91 @@ class ArtNetServer:
             self._sock.close()
         self._sock = self._thread = None
 
+    def set_assembler(self, assembler):
+        """Attach or detach a FrameAssembler. Thread-safe (guarded by lock)."""
+        with self.lock:
+            self._assembler = assembler
+
     def _loop(self):
+        # Request a large receive buffer before the first recvfrom
+        try:
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RCVBUF_SIZE)
+        except OSError:
+            pass
+        actual = self._sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+        with self.lock:
+            self.rcvbuf_actual = actual
+
+        _buf = bytearray(2048)
+        _mv = memoryview(_buf)
         sock = self._sock
+
         while self.running:
             try:
-                data, _ = sock.recvfrom(2048)
+                n, _addr = sock.recvfrom_into(_mv)
             except socket.timeout:
                 continue
-            except OSError as e:
-                if self.running:  # not a normal shutdown
-                    self.error = "Server socket error: %s" % e
+            except OSError as exc:
+                if self.running:
+                    self.error = "Server socket error: %s" % exc
                     self.running = False
                 break
-            pkt = parse_artdmx(data)
-            now = time.perf_counter()
-            with self.lock:
-                self.total_packets += 1
-                self.total_bytes += len(data)
-                self.last_packet_time = now
-                if pkt is None:
+
+            if n < 10 or _buf[:8] != ARTNET_ID:
+                with self.lock:
+                    self.total_packets += 1
+                    self.total_bytes += n
                     self.ignored_packets += 1
-                    continue
-                port_address, _seq, dmx = pkt
-                self.latest[port_address] = dmx.ljust(512, b"\x00")[:512]
-                st = self.uni_stats.setdefault(port_address, {"count": 0, "length": 0})
-                st["count"] += 1
-                st["length"] = len(dmx)
+                continue
+
+            opcode = _buf[8] | (_buf[9] << 8)
+            now = time.perf_counter()
+
+            if opcode == OP_DMX and n >= 18:
+                dmx_len = (_buf[16] << 8) | _buf[17]
+                if 18 + dmx_len > n:
+                    dmx_len = n - 18
+                port_address = ((_buf[15] & 0x7F) << 8) | _buf[14]
+                seq = _buf[12]
+
+                with self.lock:
+                    self.total_packets += 1
+                    self.total_bytes += n
+                    self.last_packet_time = now
+                    if seq != 0:
+                        last_s = self._seq_last.get(port_address)
+                        if last_s is not None:
+                            expected_s = last_s % 255 + 1
+                            if expected_s != seq:
+                                gap = (seq - expected_s + 255) % 255
+                                if 0 < gap <= 128:
+                                    self.lost_packets += gap
+                        self._seq_last[port_address] = seq
+                    cap = min(dmx_len, 512)
+                    padded = bytes(_mv[18:18 + cap]) + b"\x00" * (512 - cap)
+                    self.latest[port_address] = padded
+                    st = self.uni_stats.setdefault(port_address, {"count": 0, "length": 0})
+                    st["count"] += 1
+                    st["length"] = dmx_len
+
+                asm = self._assembler   # read under GIL; atomic
+                if asm is not None:
+                    asm.on_universe(port_address, _mv, n, dmx_len)
+
+            elif opcode == OP_SYNC:
+                with self.lock:
+                    self.total_packets += 1
+                    self.total_bytes += n
+                    self.last_packet_time = now
+                asm = self._assembler
+                if asm is not None:
+                    asm.on_artsync()
+
+            else:
+                with self.lock:
+                    self.total_packets += 1
+                    self.total_bytes += n
+                    self.ignored_packets += 1
 
     def snapshot(self):
         with self.lock:
@@ -120,32 +270,10 @@ class ArtNetServer:
                 self.ignored_packets,
                 self.total_bytes,
                 self.last_packet_time,
+                self.lost_packets,
+                self.rcvbuf_actual,
             )
 
-
-def build_spans(
-    start_universe, start_channel, channels_per_chip, chips, chips_per_universe=0
-):
-    """Lay chips out over universes: [(universe, first_channel0, channel_count, offset_in_frame)]."""
-    if channels_per_chip < 1 or channels_per_chip > 512:
-        raise ValueError("Channels per chip must be between 1 and 512")
-    if not 1 <= start_channel <= 512:
-        raise ValueError("Start channel must be between 1 and 512")
-    cap = 512 // channels_per_chip
-    per_u = min(chips_per_universe, cap) if chips_per_universe > 0 else cap
-    spans, placed, uni, ch = [], 0, start_universe, start_channel - 1
-    while placed < chips:
-        fit = min(per_u, (512 - ch) // channels_per_chip)
-        if fit <= 0:
-            raise ValueError(
-                "Not a single chip fits into the universe: lower the start channel"
-            )
-        n = min(fit, chips - placed)
-        spans.append((uni, ch, n * channels_per_chip, placed * channels_per_chip))
-        placed += n
-        uni += 1
-        ch = 0
-    return spans
 
 
 class Recorder:
@@ -154,24 +282,35 @@ class Recorder:
     def __init__(self, server):
         self.server = server
         self.frames = []
+        self.frames_captured = 0  # counts all frames put to frames or out_queue
         self.stride = 0
         self.fps = 30.0
         self.max_frames = 0
         self.spans = []
         self.state = "idle"  # idle | waiting | recording | done
-        self.missing = 0  # frames where at least one mapped universe had no data
-        self.late = 0  # frames sampled more than 1.5 periods late
+        self.missing = 0    # frames with at least one universe missing
+        self.late = 0       # frames sampled more than 1.5 periods late
         self.elapsed = 0.0
-        self.error = None  # set if the recording thread fails
+        self.error = None
+        self._assembler = None  # FrameAssembler | None
+        self._out_queue = None  # queue.Queue | None (PLSQ streaming mode)
         self._stop = threading.Event()
         self._thread = None
 
-    def start(self, spans, stride, fps, max_frames=0, wait_first_packet=True):
+    @property
+    def partial_source_frames(self):
+        return self._assembler.partial_count if self._assembler is not None else 0
+
+    def start(self, spans, stride, fps, max_frames=0, wait_first_packet=True,
+              assembler=None, out_queue=None):
         self.frames, self.spans, self.stride = [], spans, stride
         self.fps, self.max_frames = float(fps), int(max_frames)
+        self.frames_captured = 0
         self.missing = self.late = 0
         self.elapsed = 0.0
         self.error = None
+        self._assembler = assembler
+        self._out_queue = out_queue
         self._stop.clear()
         self.state = "waiting" if wait_first_packet else "recording"
         self._thread = threading.Thread(
@@ -185,6 +324,10 @@ class Recorder:
             self._thread.join(timeout=2.0)
 
     def _sample(self):
+        asm = self._assembler
+        if asm is not None and asm.enabled:
+            frame = asm.committed_frame
+            return frame, (frame is None)
         with self.server.lock:
             latest = self.server.latest
             out, miss = bytearray(self.stride), False
@@ -199,8 +342,8 @@ class Recorder:
     def _run(self, wait_first_packet):
         try:
             self._capture(wait_first_packet)
-        except Exception as e:  # keep the GUI alive and report the problem
-            self.error = "Recorder failed: %s" % e
+        except Exception as exc:
+            self.error = "Recorder failed: %s" % exc
         finally:
             self.state = "done"
 
@@ -231,7 +374,19 @@ class Recorder:
             if now - target > 1.5 * period:
                 self.late += 1
             frame, miss = self._sample()
-            self.frames.append(frame)
+            if frame is None:
+                frame = bytes(self.stride)  # zeros while no frame committed yet
+            if self._out_queue is not None:
+                try:
+                    self._out_queue.put_nowait(frame)
+                except queue.Full:
+                    self.error = (
+                        "Queue overflow: disk too slow — PLSQ recording stopped."
+                    )
+                    break
+            else:
+                self.frames.append(frame)
+            self.frames_captured += 1
             if miss:
                 self.missing += 1
             k += 1
@@ -269,30 +424,121 @@ def postprocess(frames, skip=0, blend=0, final=None):
     return [bytes(f) for f in out]
 
 
+def _blend_frames(tail_frames, head_frames):
+    """Blend tail into head: out[i] = round(tail[i]*(1-w) + head[i]*w), w = i/len."""
+    n = len(head_frames)
+    result = []
+    for i in range(n):
+        w = i / float(n)
+        t, h = tail_frames[i], head_frames[i]
+        out = bytearray(len(h))
+        for j in range(len(h)):
+            out[j] = int(round(t[j] * (1.0 - w) + h[j] * w))
+        result.append(bytes(out))
+    return result
+
+
+class PlsqStreamWriter:
+    """Consumes frames from a queue, writes them to a PlsqWriter (streaming .plsq).
+
+    Call start(q), then join() after the sampler sends the None sentinel.
+    After join(): check error; if None, frames_written and bytes_written are valid.
+    """
+
+    def __init__(self, writer, skip, blend, stride):
+        self._writer = writer
+        self._skip = skip
+        self._blend = blend
+        self._stride = stride
+        self.frames_written = 0
+        self.bytes_written = 0
+        self.error = None
+        self._thread = None
+
+    def start(self, q):
+        self._q = q
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def join(self, timeout=None):
+        if self._thread:
+            self._thread.join(timeout=timeout)
+
+    @property
+    def is_alive(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    def _run(self):
+        try:
+            self._write_loop()
+        except Exception as exc:
+            self.error = str(exc)
+
+    def _write_loop(self):
+        skip_left = self._skip
+        blend = self._blend
+        delay = collections.deque()
+
+        while True:
+            try:
+                frame = self._q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            self._q.task_done()
+
+            if frame is None:  # sentinel: sampler finished
+                break
+
+            if skip_left > 0:
+                skip_left -= 1
+                continue
+
+            if blend > 0:
+                delay.append(frame)
+                if len(delay) > blend:
+                    to_write = delay.popleft()
+                    self._writer.append_frame(to_write)
+                    self.frames_written += 1
+                    self.bytes_written += self._stride
+            else:
+                self._writer.append_frame(frame)
+                self.frames_written += 1
+                self.bytes_written += self._stride
+
+        # Apply loop blend: rewrite the first min(blend, frames_written) frames
+        tail = list(delay)
+        if blend > 0 and tail and self.frames_written > 0:
+            actual_blend = min(blend, len(tail), self.frames_written)
+            t_start = time.perf_counter()
+            head = self._writer.read_frames(0, actual_blend)
+            blended = _blend_frames(tail[:actual_blend], head)
+            elapsed = time.perf_counter() - t_start
+            if elapsed > 10.0:
+                self.error = (
+                    "Loop blend took %.1f s (> 10 s limit). "
+                    "Consider reducing blend length or chip count." % elapsed
+                )
+                return
+            self._writer.rewrite_frames(0, blended)
+
+
 _LUT = [json.dumps(round(i / 255.0, 3)) for i in range(256)]  # 0 -> "0.0", 255 -> "1.0"
 
 
-def fmt_num(v):
-    v = float(v)
-    return str(int(v)) if v.is_integer() else ("%g" % v)
+def write_json(path, meta, frames):
+    """Write a JSON sequence file.
 
-
-def write_json(path, meta, frames, stride, fps):
-    count = len(frames)
-    header = [
-        ("model_name", meta["model_name"]),
-        ("model_chips_tag", meta["model_chips_tag"]),
-        ("model_chips_count", str(meta["model_chips_count"])),
-        ("sequence_name", meta["sequence_name"]),
-        ("sequence_version", meta["sequence_version"]),
-        ("sequence_duration_sec", str(round(count / float(fps), 3))),
-        ("sequence_fps", fmt_num(fps)),
-        ("sequence_frame_count", str(count)),
-        ("sequence_frame_stride", str(stride)),
-        ("developer_notes", meta["developer_notes"]),
-    ]
+    meta must be the 27-key dict returned by build_meta() with file_format="json".
+    Raises ValueError when universes_count > 2 (D3: JSON only for small installs).
+    """
+    n_uni = int(meta["input_mapping_universes_count"])
+    if n_uni > 2:
+        raise ValueError(
+            "JSON export is not available for 3 or more universes (got %d). "
+            "Use PLSQ format instead." % n_uni
+        )
     lines = ["{"]
-    for k, v in header:
+    for k, v in meta.items():
         lines.append(
             "  %s: %s,"
             % (json.dumps(k, ensure_ascii=False), json.dumps(v, ensure_ascii=False))
@@ -348,16 +594,17 @@ FIELDS = [
     ("Sequence Name", "sequence_name", "Random Colored Loop Flashing"),
     ("Sequence Version", "sequence_version", "1.0"),
     ("Sequence Duration (0 = manual)", "sequence_duration_sec", "6.0"),
-    ("Sequence Fps", "sequence_fps", "30"),
+    # Sequence Fps rendered as radio buttons (30 / 60) — not an Entry
     ("Sequence Frame Count", "sequence_frame_count", ""),
     ("Sequence Frame Stride", "sequence_frame_stride", ""),
     ("Developer Notes", "developer_notes", "Notes by developer or smb who worked..."),
 ]
 READONLY = {"sequence_frame_count", "sequence_frame_stride"}
+MAP_READONLY = {"channels_per_chip"}
 MAPPING = [
     ("Start Universe", "start_universe", "1"),
     ("Start channel", "start_channel", "1"),
-    ("Channels per chip (3 = RGB, 4 = RGBW)", "channels_per_chip", "3"),
+    ("Channels per chip", "channels_per_chip", "4"),
     ("Chips per universe (0 = auto)", "chips_per_universe", "0"),
 ]
 
@@ -429,7 +676,7 @@ def ask_choice(parent, title, message, buttons):
 class App(tk.Tk if tk else object):
     def __init__(self):
         super().__init__()
-        self.title(f"Art-Net to JSON Sequence Recorder v.{APPV}")
+        self.title(f"Art Stream Sequence Recorder v.{APPV}")
         self.configure(bg=BG)
         self.geometry("1140x900")
         self.minsize(1000, 860)
@@ -440,8 +687,13 @@ class App(tk.Tk if tk else object):
         self.host_var, self.port_var = tk.StringVar(value="127.0.0.1"), tk.StringVar(
             value="6454"
         )
-        self.path_var = tk.StringVar(value=os.path.join(os.getcwd(), "sequence_1.json"))
+        self.path_var = tk.StringVar(value=os.path.join(os.getcwd(), "sequence_1.plsq"))
+        self.fps_var = tk.IntVar(value=30)
+        self.fmt_var = tk.StringVar(value="plsq")
+        self.universes_var = tk.StringVar(value="")
+        self.eff_cpu_var = tk.StringVar(value="")
         self.wait_var = tk.BooleanVar(value=True)
+        self.complete_frames_var = tk.BooleanVar(value=True)
         self.skip_on, self.skip_n = tk.BooleanVar(value=False), tk.StringVar(value="1")
         self.blend_on, self.blend_n = tk.BooleanVar(value=False), tk.StringVar(
             value="30"
@@ -449,12 +701,16 @@ class App(tk.Tk if tk else object):
         self.last_saved = ""
         self.errors = []  # [(time, message)] shown in the statistics block
         self.saved_path = None  # file written by the last successful save
-        self.pending = None  # finished recording that has not been saved yet
+        self.pending = None  # finished recording that has not been saved yet (JSON)
         self._approved = None  # path key the user agreed to overwrite
         self._was_recording = False
-        self._job = (
-            None  # settings of the current recording (target frames, skip, blend)
-        )
+        self._job = None  # settings of the current recording (target frames, skip, blend)
+        # PLSQ streaming state
+        self._plsq_sw = None      # PlsqStreamWriter | None
+        self._plsq_writer = None  # PlsqWriter | None
+        self._plsq_queue = None   # queue.Queue | None
+        self._plsq_part = None    # path to .part file
+        self._plsq_target = None  # final target path
         self._prev = (time.perf_counter(), 0, {})
         self._rates = (0.0, {})
         self._build()
@@ -551,14 +807,41 @@ class App(tk.Tk if tk else object):
         tk.Label(left, text="JSON Fields:", **title).grid(
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 8)
         )
-        for i, (label, key, _d) in enumerate(FIELDS, start=1):
-            self._lbl(left, label).grid(
-                row=i, column=0, sticky="nsew", padx=(0, 10), pady=1
+        _row = 1
+        for _label, _key, _d in FIELDS:
+            self._lbl(left, _label).grid(
+                row=_row, column=0, sticky="nsew", padx=(0, 10), pady=1
             )
-            self._entry(left, self.vars[key], readonly=key in READONLY).grid(
-                row=i, column=1, sticky="nsew", pady=1, ipady=5
+            self._entry(left, self.vars[_key], readonly=_key in READONLY).grid(
+                row=_row, column=1, sticky="nsew", pady=1, ipady=5
             )
-        r = len(FIELDS) + 1
+            _row += 1
+            if _key == "sequence_duration_sec":
+                self._lbl(left, "Sequence Fps").grid(
+                    row=_row, column=0, sticky="nsew", padx=(0, 10), pady=1
+                )
+                _fps_frm = tk.Frame(
+                    left,
+                    bg=FIELD,
+                    highlightthickness=1,
+                    highlightbackground=BORDER,
+                )
+                for _fps_val in (30, 60):
+                    tk.Radiobutton(
+                        _fps_frm,
+                        text=str(_fps_val),
+                        variable=self.fps_var,
+                        value=_fps_val,
+                        bg=FIELD,
+                        fg=FG,
+                        selectcolor=FIELD,
+                        activebackground=FIELD,
+                        activeforeground=FG,
+                        highlightthickness=0,
+                    ).pack(side="left", padx=(8, 0), pady=4)
+                _fps_frm.grid(row=_row, column=1, sticky="nsew", pady=1)
+                _row += 1
+        r = _row
         tk.Label(left, text="Input mapping:", **title).grid(
             row=r, column=0, columnspan=2, sticky="w", pady=(14, 6)
         )
@@ -566,10 +849,33 @@ class App(tk.Tk if tk else object):
             self._lbl(left, label).grid(
                 row=r + 1 + j, column=0, sticky="nsew", padx=(0, 10), pady=1
             )
-            self._entry(left, self.map_vars[key]).grid(
-                row=r + 1 + j, column=1, sticky="nsew", pady=1, ipady=5
-            )
-        r2 = r + 1 + len(MAPPING)
+            if key == "chips_per_universe":
+                _cpu_frm = tk.Frame(left, bg=BG)
+                _cpu_frm.grid(row=r + 1 + j, column=1, sticky="nsew", pady=1)
+                _cpu_frm.columnconfigure(0, weight=1)
+                self._entry(_cpu_frm, self.map_vars[key]).grid(
+                    row=0, column=0, sticky="ew", ipady=5
+                )
+                tk.Label(
+                    _cpu_frm,
+                    textvariable=self.eff_cpu_var,
+                    bg=BG,
+                    fg=FG_DIM,
+                    padx=8,
+                    font=("Segoe UI", 9),
+                ).grid(row=0, column=1, sticky="w")
+            else:
+                self._entry(
+                    left, self.map_vars[key], readonly=key in MAP_READONLY
+                ).grid(row=r + 1 + j, column=1, sticky="nsew", pady=1, ipady=5)
+        _r_univ = r + 1 + len(MAPPING)
+        self._lbl(left, "Universes (calculated)").grid(
+            row=_r_univ, column=0, sticky="nsew", padx=(0, 10), pady=1
+        )
+        self._entry(left, self.universes_var, readonly=True).grid(
+            row=_r_univ, column=1, sticky="nsew", pady=1, ipady=5
+        )
+        r2 = _r_univ + 1
         tk.Label(left, text="Post-processing (off by default):", **title).grid(
             row=r2, column=0, columnspan=2, sticky="w", pady=(14, 6)
         )
@@ -593,8 +899,45 @@ class App(tk.Tk if tk else object):
             wraplength=470,
             font=("Segoe UI", 9),
         ).grid(row=r2 + 3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        fmt_frm = tk.Frame(left, bg=BG)
+        fmt_frm.grid(row=r2 + 4, column=0, columnspan=2, sticky="ew", pady=(10, 2))
+        tk.Label(fmt_frm, text="Output format:", bg=BG, fg=FG).pack(side="left")
+        tk.Radiobutton(
+            fmt_frm,
+            text=".plsq",
+            variable=self.fmt_var,
+            value="plsq",
+            command=self._on_fmt_change,
+            bg=BG,
+            fg=FG,
+            selectcolor=FIELD,
+            activebackground=BG,
+            activeforeground=FG,
+            highlightthickness=0,
+        ).pack(side="left", padx=(10, 0))
+        self._json_radio = tk.Radiobutton(
+            fmt_frm,
+            text="JSON (.json)",
+            variable=self.fmt_var,
+            value="json",
+            command=self._on_fmt_change,
+            bg=BG,
+            fg=FG,
+            selectcolor=FIELD,
+            activebackground=BG,
+            activeforeground=FG,
+            highlightthickness=0,
+        )
+        self._json_radio.pack(side="left", padx=(8, 0))
+        tk.Label(
+            fmt_frm,
+            text="  JSON: up to 2 universes only",
+            bg=BG,
+            fg=FG_DIM,
+            font=("Segoe UI", 9),
+        ).pack(side="left")
         pf = tk.Frame(left, bg=BG)
-        pf.grid(row=r2 + 4, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+        pf.grid(row=r2 + 5, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         pf.columnconfigure(0, weight=1)
         self._entry(pf, self.path_var).grid(row=0, column=0, sticky="ew", ipady=6)
         tk.Button(
@@ -650,11 +993,26 @@ class App(tk.Tk if tk else object):
         self._check(right, "Start recording on first packet", self.wait_var).grid(
             row=4, column=0, sticky="w", pady=(8, 0)
         )
+        self._check(
+            right,
+            "Wait for complete source frames (recommended)",
+            self.complete_frames_var,
+        ).grid(row=5, column=0, sticky="w", pady=(2, 0))
         self._update_buttons()
 
     def _sync_post(self):
         self.skip_entry.config(state="normal" if self.skip_on.get() else "disabled")
         self.blend_entry.config(state="normal" if self.blend_on.get() else "disabled")
+
+    def _on_fmt_change(self):
+        """Swap path extension when the format radio button changes."""
+        p = self.path_var.get().strip()
+        base, ext = os.path.splitext(p)
+        new_fmt = self.fmt_var.get()
+        if new_fmt == "plsq" and ext.lower() == ".json":
+            self.path_var.set(base + ".plsq")
+        elif new_fmt == "json" and ext.lower() == ".plsq":
+            self.path_var.set(base + ".json")
 
     # ---- errors (shown in the statistics block) ---------------------------------
     def _err(self, msg):
@@ -666,9 +1024,15 @@ class App(tk.Tk if tk else object):
 
     # ---- actions -------------------------------------------------------------
     def _browse(self):
+        if self.fmt_var.get() == "plsq":
+            default_ext = ".plsq"
+            ftypes = [("PLSQ Sequence", "*.plsq"), ("All files", "*.*")]
+        else:
+            default_ext = ".json"
+            ftypes = [("JSON Sequence", "*.json"), ("All files", "*.*")]
         p = filedialog.asksaveasfilename(
-            defaultextension=".json",
-            filetypes=[("JSON", "*.json")],
+            defaultextension=default_ext,
+            filetypes=ftypes,
             initialfile=os.path.basename(self.path_var.get()),
             initialdir=os.path.dirname(self.path_var.get()) or None,
         )
@@ -719,11 +1083,18 @@ class App(tk.Tk if tk else object):
             m = self._ints()
             skip, blend = self._post_values()
             chips = int(self.vars["model_chips_count"].get())
-            fps = float(self.vars["sequence_fps"].get().replace(",", "."))
+            fps = self.fps_var.get()
             dur = float(self.vars["sequence_duration_sec"].get().replace(",", ".") or 0)
-            if chips < 1 or fps <= 0 or dur < 0:
+            if chips < 1 or chips > 64000:
                 raise ValueError(
-                    "Chips amount and fps must be greater than 0, duration must be 0 or greater"
+                    "Model Chips Amount must be between 1 and 64,000 (got %d)" % chips
+                )
+            if dur < 0:
+                raise ValueError("Duration must be 0 or greater")
+            su = m["start_universe"]
+            if su < 0 or su > 32767:
+                raise ValueError(
+                    "Start Universe must be between 0 and 32,767 (got %d)" % su
                 )
             stride = chips * m["channels_per_chip"]
             spans = build_spans(
@@ -733,6 +1104,12 @@ class App(tk.Tk if tk else object):
                 chips,
                 m["chips_per_universe"],
             )
+            if su + len(spans) - 1 > 32767:
+                raise ValueError(
+                    "Start Universe %d + %d universes reaches universe %d, "
+                    "which exceeds the maximum of 32,767"
+                    % (su, len(spans), su + len(spans) - 1)
+                )
             final = int(round(dur * fps)) if dur > 0 else 0
             if final and blend > final:
                 raise ValueError(
@@ -744,18 +1121,116 @@ class App(tk.Tk if tk else object):
             return
         if not self._confirm_can_record():
             return
+        # Preflight: if packets are already arriving, check for missing/unexpected universes
+        ok, pf_msgs = self._preflight(spans)
+        for msg in pf_msgs:
+            self._err(msg)
+        if not ok:
+            return
+        # Determine output format from path extension
+        path = self.path_var.get().strip()
+        is_plsq = path.lower().endswith(".plsq")
+        # D3: JSON is not available for 3+ universes
+        if not is_plsq and len(spans) >= 3:
+            self._err(
+                "JSON format is not available for %d universes (limit: 2). "
+                "Use PLSQ format." % len(spans)
+            )
+            return
+        # For PLSQ: check for leftover .part file
+        if is_plsq:
+            part = path + ".part"
+            if os.path.exists(part) and self._approved != path_key(part):
+                choice = ask_choice(
+                    self,
+                    "Leftover recording found",
+                    "A partial recording exists:\n%s\n\nOverwrite it or cancel?" % part,
+                    [("Overwrite leftover", "overwrite"), ("Cancel", None)],
+                )
+                if choice != "overwrite":
+                    return
+        # For PLSQ: refuse if blend delay-line exceeds 1 GiB
+        if is_plsq and blend > 0:
+            delay_bytes = blend * stride
+            if delay_bytes > 1 << 30:
+                self._err(
+                    "Loop blend delay line would use %.1f GiB (blend=%d × stride=%d). "
+                    "Reduce blend frames or chip count." % (delay_bytes / (1 << 30), blend, stride)
+                )
+                return
+        # Build frame assembler (when "complete source frames" is on)
+        assembler = None
+        if self.complete_frames_var.get():
+            assembler = FrameAssembler()
+            assembler.start(spans, stride)
+        self.server.set_assembler(assembler)
         self._clear_errors()
         self.vars["sequence_frame_stride"].set(str(stride))
-        self._job = {"final": final, "skip": skip, "blend": blend}
+        eff_cpu = effective_chips_per_universe(m["chips_per_universe"])
+        self._job = {
+            "final": final, "skip": skip, "blend": blend,
+            "is_plsq": is_plsq,
+            "start_universe": m["start_universe"],
+            "start_channel": m["start_channel"],
+            "channels_per_chip": m["channels_per_chip"],
+            "chips_per_universe": eff_cpu,
+            "universes_count": len(spans),
+            "model_chips_count": chips,
+        }
+        # Start the pipeline
+        out_queue = None
+        if is_plsq:
+            part = path + ".part"
+            self._plsq_target = path
+            self._plsq_part = part
+            pw = PlsqWriter()
+            pw.open(part, chips, int(fps), m["start_universe"], m["start_channel"],
+                    eff_cpu)
+            self._plsq_writer = pw
+            q_size = max(300, int(2 * fps) + 20)
+            out_queue = queue.Queue(maxsize=q_size)
+            self._plsq_queue = out_queue
+            sw = PlsqStreamWriter(pw, skip, blend, stride)
+            sw.start(out_queue)
+            self._plsq_sw = sw
         self.rec.start(
             spans,
             stride,
             fps,
             max_frames=(skip + final + blend) if final else 0,
             wait_first_packet=self.wait_var.get(),
+            assembler=assembler,
+            out_queue=out_queue,
         )
         self._was_recording = True
         self._update_buttons()
+
+    def _preflight(self, spans):
+        """Check expected vs received universes before recording starts.
+        Returns (ok, [error/warning strings]). ok=False blocks recording."""
+        expected = set(s[0] for s in spans)
+        _, ustats, _, _, _, _, _, _ = self.server.snapshot()
+        received = set(ustats.keys())
+        if not received:
+            return True, []   # nothing yet → wait mode, fine
+        missing = expected - received
+        if missing:
+            return False, [
+                "Preflight failed: expected universes not receiving data: %s"
+                % ", ".join("U%d" % u for u in sorted(missing))
+            ]
+        u_min, u_max = min(expected), max(expected)
+        unexpected = {u for u in received if u_min <= u <= u_max and u not in expected}
+        warnings = []
+        if unexpected:
+            sample = sorted(unexpected)[:5]
+            warnings.append(
+                "Preflight warning: unexpected universes in range U%d-U%d: %s%s"
+                % (u_min, u_max,
+                   ", ".join("U%d" % u for u in sample),
+                   " ..." if len(unexpected) > 5 else "")
+            )
+        return True, warnings
 
     # ---- protecting recorded data and existing files ---------------------------------
     def _ask_file_conflict(self, path, cancel_label):
@@ -780,10 +1255,16 @@ class App(tk.Tk if tk else object):
 
     def _choose_new_path(self, path):
         suggestion = next_free_path(path)
+        if os.path.splitext(path)[1].lower() == ".plsq":
+            default_ext = ".plsq"
+            ftypes = [("PLSQ Sequence", "*.plsq"), ("All files", "*.*")]
+        else:
+            default_ext = ".json"
+            ftypes = [("JSON Sequence", "*.json"), ("All files", "*.*")]
         return filedialog.asksaveasfilename(
             title="Save as new file",
-            defaultextension=".json",
-            filetypes=[("JSON", "*.json")],
+            defaultextension=default_ext,
+            filetypes=ftypes,
             initialdir=os.path.dirname(suggestion) or None,
             initialfile=os.path.basename(suggestion),
         )
@@ -835,13 +1316,135 @@ class App(tk.Tk if tk else object):
         return True
 
     def _finish_recording(self):
+        self.server.set_assembler(None)   # detach assembler now that recording ended
         self._was_recording = False
         self._update_buttons()
-        job, raw = self._job, self.rec.frames
+        job = self._job
+        fps = self.rec.fps
+        # Capture stats from the recorder/server before anything can reset them
+        rec_missing = self.rec.missing
+        rec_late = self.rec.late
+        rec_partial = self.rec.partial_source_frames
+        _, _, _, _, _, _, lost_pkts, _ = self.server.snapshot()
+        mapping_fields = {
+            "start_universe": job["start_universe"],
+            "start_channel": job["start_channel"],
+            "channels_per_chip": job["channels_per_chip"],
+            "chips_per_universe": job["chips_per_universe"],
+            "universes_count": job["universes_count"],
+            "model_chips_count": job["model_chips_count"],
+        }
+        stats_fields = {
+            "missing": rec_missing,
+            "late": rec_late,
+            "partial_source_frames": rec_partial,
+            "lost_packets": lost_pkts,
+        }
+        if job.get("is_plsq"):
+            self._finish_plsq(job, fps, mapping_fields, stats_fields)
+        else:
+            self._finish_json(job, fps, mapping_fields, stats_fields)
+
+    def _finish_plsq(self, job, fps, mapping_fields, stats_fields):
+        """Finalize a PLSQ streaming recording."""
+        sw = self._plsq_sw
+        pw = self._plsq_writer
+        part = self._plsq_part
+        target = self._plsq_target
+
+        # Send sentinel so the writer thread knows the sampler is done
+        q = self._plsq_queue
+        if q is not None:
+            try:
+                q.put(None, timeout=2.0)
+            except Exception:
+                pass
+        self._plsq_queue = None
+        if sw is not None:
+            sw.join(timeout=30.0)
+
+        # Clean up state references
+        self._plsq_sw = None
+        self._plsq_writer = None
+        self._plsq_part = None
+        self._plsq_target = None
+
+        if sw is not None and sw.error:
+            self._err(
+                "PLSQ writer error: %s — partial file kept at %s" % (sw.error, part)
+            )
+            try:
+                pw.abort()
+            except Exception:
+                pass
+            return
+
+        final = sw.frames_written if sw is not None else 0
+        if final == 0:
+            self._err(
+                "PLSQ recording produced 0 exported frames "
+                "(check skip/blend settings). Partial file kept at %s" % part
+            )
+            try:
+                pw.abort()
+            except Exception:
+                pass
+            return
+
+        # Finalize the writer: write meta, set FINALIZED flag
+        blend_applied = min(job["blend"], final) if job["blend"] else 0
+        meta = build_meta(
+            file_format="plsq",
+            recorder_version=APPV,
+            model_name=self.vars["model_name"].get(),
+            model_chips_tag=self.vars["model_chips_tag"].get(),
+            sequence_name=self.vars["sequence_name"].get(),
+            sequence_version=self.vars["sequence_version"].get(),
+            developer_notes=self.vars["developer_notes"].get(),
+            fps=int(fps),
+            frame_count=final,
+            frame_stride=self.rec.stride,
+            post_skip_frames=job["skip"],
+            post_loop_blend_frames=blend_applied,
+            recorded_frames_raw=self.rec.frames_captured,
+            start_universe=mapping_fields["start_universe"],
+            start_channel=mapping_fields["start_channel"],
+            channels_per_chip=mapping_fields["channels_per_chip"],
+            chips_per_universe=mapping_fields["chips_per_universe"],
+            universes_count=mapping_fields["universes_count"],
+            model_chips_count=mapping_fields["model_chips_count"],
+            missing_frames=stats_fields["missing"],
+            late_frames=stats_fields["late"],
+            partial_source_frames=stats_fields["partial_source_frames"],
+            lost_packets=stats_fields["lost_packets"],
+        )
+        try:
+            pw.finalize(meta)
+        except Exception as e:
+            self._err(
+                "PLSQ finalize error: %s — partial file kept at %s" % (e, part)
+            )
+            return
+        try:
+            os.replace(part, target)
+        except OSError as e:
+            self._err(
+                "Could not rename %s → %s: %s" % (part, target, e)
+            )
+            return
+        size = os.path.getsize(target)
+        self.last_saved = "Saved: %s\n%d frames, %.1f MB" % (
+            target, final, size / (1024 * 1024)
+        )
+        self.saved_path = target
+        self._approved = None
+
+    def _finish_json(self, job, fps, mapping_fields, stats_fields):
+        """Finalize a JSON (in-memory) recording."""
+        raw = self.rec.frames
         if not raw:
             self.last_saved = "Nothing to save: 0 frames recorded."
             return
-        fps = self.rec.fps
         avail = len(raw) - job["skip"]
         final = (
             min(job["final"], avail - job["blend"])
@@ -853,7 +1456,8 @@ class App(tk.Tk if tk else object):
             frames = postprocess(raw, job["skip"], job["blend"], final)
         except ValueError as e:
             # keep the raw recording so that nothing is lost
-            self.pending = dict(base, frames=list(raw), skip=0, blend=0)
+            self.pending = dict(base, frames=list(raw), skip=0, blend=0,
+                                **mapping_fields, **stats_fields)
             self._err("Post-processing failed: %s" % e)
             self.last_saved = (
                 "Not saved: the raw recording (%d frames) is kept in memory.\n"
@@ -862,7 +1466,8 @@ class App(tk.Tk if tk else object):
             return
         self.vars["sequence_frame_count"].set(str(len(frames)))
         self.vars["sequence_duration_sec"].set(str(round(len(frames) / fps, 3)))
-        self.pending = dict(base, frames=frames, skip=job["skip"], blend=job["blend"])
+        self.pending = dict(base, frames=frames, skip=job["skip"], blend=job["blend"],
+                            **mapping_fields, **stats_fields)
         self._save_pending()
 
     def _save_pending(self):
@@ -883,16 +1488,37 @@ class App(tk.Tk if tk else object):
                 return
             path = chosen
             self.path_var.set(path)
-        meta = {
-            "model_name": self.vars["model_name"].get(),
-            "model_chips_tag": self.vars["model_chips_tag"].get(),
-            "model_chips_count": self.vars["model_chips_count"].get(),
-            "sequence_name": self.vars["sequence_name"].get(),
-            "sequence_version": self.vars["sequence_version"].get(),
-            "developer_notes": self.vars["developer_notes"].get(),
-        }
+        meta = build_meta(
+            file_format="json",
+            recorder_version=APPV,
+            model_name=self.vars["model_name"].get(),
+            model_chips_tag=self.vars["model_chips_tag"].get(),
+            model_chips_count=p["model_chips_count"],
+            sequence_name=self.vars["sequence_name"].get(),
+            sequence_version=self.vars["sequence_version"].get(),
+            fps=int(p["fps"]),
+            frame_count=len(p["frames"]),
+            frame_stride=p["stride"],
+            start_universe=p["start_universe"],
+            start_channel=p["start_channel"],
+            channels_per_chip=p["channels_per_chip"],
+            chips_per_universe=p["chips_per_universe"],
+            universes_count=p["universes_count"],
+            post_skip_frames=p["skip"],
+            post_loop_blend_frames=p["blend"],
+            recorded_frames_raw=p["recorded"],
+            missing_frames=p["missing"],
+            late_frames=p["late"],
+            partial_source_frames=p["partial_source_frames"],
+            lost_packets=p["lost_packets"],
+            developer_notes=self.vars["developer_notes"].get(),
+        )
         try:
-            size = write_json(path, meta, p["frames"], p["stride"], p["fps"])
+            size = write_json(path, meta, p["frames"])
+        except ValueError as e:
+            self._err(str(e))
+            self.last_saved = "Not saved: the recording is kept in memory."
+            return
         except OSError as e:
             self._err("Could not write the file: %s (recording kept in memory)" % e)
             self.last_saved = "Not saved: the recording is kept in memory."
@@ -968,27 +1594,54 @@ class App(tk.Tk if tk else object):
         if self.rec.error:
             self._err(self.rec.error)
             self.rec.error = None
+        # If the PLSQ writer failed (e.g. disk full), stop the recording
+        if self._plsq_sw is not None and self._plsq_sw.error:
+            self._err("PLSQ writer: %s" % self._plsq_sw.error)
+            if self.rec.state in ("waiting", "recording"):
+                self.rec.stop()
         if not self.server.running and self.rec.state in ("waiting", "recording"):
             self.rec.stop()  # the source is gone: finish what has been recorded
         if self._was_recording and self.rec.state == "done":
             self._finish_recording()
-        if self.rec.state not in ("waiting", "recording"):  # derived fields while idle
-            try:
-                chips = int(self.vars["model_chips_count"].get())
-                cpc = int(self.map_vars["channels_per_chip"].get())
+        # Live derived fields — always update (also during recording)
+        try:
+            chips = int(self.vars["model_chips_count"].get())
+            cpc = int(self.map_vars["channels_per_chip"].get())
+            cpu_raw = int(self.map_vars["chips_per_universe"].get())
+            eff_cpu = effective_chips_per_universe(cpu_raw)
+            n_uni = (chips + eff_cpu - 1) // eff_cpu
+            self.universes_var.set(str(n_uni))
+            self.eff_cpu_var.set(
+                "auto → %d" % eff_cpu if cpu_raw == 0 else str(eff_cpu)
+            )
+            if self.rec.state not in ("waiting", "recording"):
                 self._set_ro("sequence_frame_stride", str(chips * cpc))
                 dur = float(
                     self.vars["sequence_duration_sec"].get().replace(",", ".") or 0
                 )
-                fps = float(self.vars["sequence_fps"].get().replace(",", "."))
+                fps = self.fps_var.get()
                 if self.rec.state == "idle":
                     self._set_ro(
                         "sequence_frame_count",
                         str(int(round(dur * fps))) if dur > 0 else "",
                     )
-            except ValueError:
-                pass
-        latest, ustats, total, ignored, nbytes, last = self.server.snapshot()
+        except (ValueError, ZeroDivisionError):
+            self.universes_var.set("?")
+            self.eff_cpu_var.set("")
+        # JSON format: disable radio when 3+ universes, force back to plsq if needed
+        try:
+            n_uni_str = self.universes_var.get()
+            if n_uni_str and n_uni_str != "?":
+                if int(n_uni_str) >= 3:
+                    if self.fmt_var.get() == "json":
+                        self.fmt_var.set("plsq")
+                        self._on_fmt_change()
+                    self._json_radio.config(state="disabled")
+                else:
+                    self._json_radio.config(state="normal")
+        except (ValueError, AttributeError):
+            pass
+        latest, ustats, total, ignored, nbytes, last, lost_pkts, rcvbuf = self.server.snapshot()
         now = time.perf_counter()
         pt, pn, pu = self._prev
         if now - pt >= 0.9:
@@ -1004,67 +1657,104 @@ class App(tk.Tk if tk else object):
             L.append(
                 ("Server: RUNNING  %s:%d" % (self.server.host, self.server.port), None)
             )
+            if rcvbuf:
+                L.append(("SO_RCVBUF: %d KiB" % (rcvbuf >> 10), None))
             ago = "-" if not last else "%.2f s ago" % (now - last)
             L.append(("Packets: %d  (%.1f pkt/s)  last: %s" % (total, rate, ago), None))
             if ignored:
                 L.append(("Ignored (not ArtDMX): %d" % ignored, None))
+            if lost_pkts:
+                L.append(("Lost (seq gaps, approx): %d" % lost_pkts, "warn"))
             L.append(("Universes received:", None))
             if ustats:
-                for u in sorted(ustats):
-                    L.append(
-                        (
+                unis = sorted(ustats)
+                if len(unis) <= 16:
+                    for u in unis:
+                        L.append((
                             "  U%-4d %6.1f pkt/s   %3d ch"
                             % (u, urates.get(u, 0.0), ustats[u]["length"]),
                             None,
-                        )
-                    )
+                        ))
+                else:
+                    # Compact summary for large installations
+                    u_min, u_max = unis[0], unis[-1]
+                    rates_list = [urates.get(u, 0.0) for u in unis]
+                    lengths = [ustats[u]["length"] for u in unis]
+                    avg_r = sum(rates_list) / len(rates_list)
+                    min_r = min(rates_list)
+                    max_r = max(rates_list)
+                    median_r = sorted(rates_list)[len(rates_list) // 2]
+                    median_l = sorted(lengths)[len(lengths) // 2]
+                    L.append((
+                        "  U%d-U%d  count=%d  avg=%.0f  min=%.0f  max=%.0f pkt/s"
+                        % (u_min, u_max, len(unis), avg_r, min_r, max_r),
+                        None,
+                    ))
+                    if len(set(lengths)) > 1:
+                        L.append(("  WARNING: inconsistent channel lengths", "warn"))
+                    irregular = [
+                        (u, urates.get(u, 0.0), ustats[u]["length"])
+                        for u in unis
+                        if urates.get(u, 0.0) < 0.9 * median_r
+                        or ustats[u]["length"] != median_l
+                    ]
+                    if irregular:
+                        L.append(("  Irregular (%d):" % len(irregular), None))
+                        for u, r_, l_ in irregular[:5]:
+                            L.append(("    U%d  %.1f pkt/s  %d ch" % (u, r_, l_), None))
             else:
                 L.append(("  (nothing received yet)", None))
         else:
             L.append(("Server: STOPPED", None))
         L.append(("", None))
         st = self.rec.state
+        is_plsq = self._job is not None and self._job.get("is_plsq")
         if st == "waiting":
             L.append(("Recording: waiting for the first packet...", None))
         elif st == "recording":
             tgt = ("/%d" % self.rec.max_frames) if self.rec.max_frames else ""
-            L.append(
-                (
+            fc = self.rec.frames_captured
+            if is_plsq:
+                sw = self._plsq_sw
+                q = self._plsq_queue
+                written = sw.bytes_written if sw else 0
+                q_depth = q.qsize() if q else 0
+                L.append((
+                    "REC PLSQ  %d%s frames  (%.2f s)  queue: %d  written: %.1f MB"
+                    % (fc, tgt, self.rec.elapsed, q_depth, written / (1024 * 1024)),
+                    None,
+                ))
+            else:
+                L.append((
                     "REC  %d%s frames  (%.2f s)"
                     % (len(self.rec.frames), tgt, self.rec.elapsed),
                     None,
-                )
-            )
+                ))
             if self._job and (self._job["skip"] or self._job["blend"]):
-                L.append(
-                    (
-                        "plan: skip %d + export %s + blend %d"
-                        % (
-                            self._job["skip"],
-                            self._job["final"] or "?",
-                            self._job["blend"],
-                        ),
-                        None,
-                    )
-                )
-            L.append(
-                ("missing: %d   late: %d" % (self.rec.missing, self.rec.late), None)
-            )
-        elif st == "done":
-            L.append(
-                (
-                    "Recorded: %d frames  missing: %d  late: %d"
-                    % (len(self.rec.frames), self.rec.missing, self.rec.late),
+                L.append((
+                    "plan: skip %d + export %s + blend %d"
+                    % (self._job["skip"], self._job["final"] or "?", self._job["blend"]),
                     None,
-                )
-            )
+                ))
+            partial = self.rec.partial_source_frames
+            L.append((
+                "missing: %d   late: %d   partial_src: %d"
+                % (self.rec.missing, self.rec.late, partial),
+                None,
+            ))
+        elif st == "done":
+            partial = self.rec.partial_source_frames
+            fc = self.rec.frames_captured
+            L.append((
+                "Recorded: %d frames  missing: %d  late: %d  partial_src: %d"
+                % (fc if is_plsq else len(self.rec.frames), self.rec.missing, self.rec.late, partial),
+                None,
+            ))
             if self.rec.missing:
-                L.append(
-                    (
-                        "Warning: some frames had no data for a universe from Input mapping.",
-                        "warn",
-                    )
-                )
+                L.append((
+                    "Warning: some frames had no data for a universe from Input mapping.",
+                    "warn",
+                ))
         if self.last_saved:
             L.append(("", None))
             L.extend((line, None) for line in self.last_saved.split("\n"))

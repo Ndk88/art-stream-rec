@@ -1,7 +1,7 @@
 @echo off
 setlocal
 rem ---------------------------------------------------------------
-rem  Launcher for main.py (Art-Net to JSON Sequence Recorder)
+rem  Launcher for main.py (Art Stream Sequence Recorder)
 rem  Usage:  run.bat          - start the app (no console window)
 rem          run.bat debug    - start with a console to see errors
 rem  Keep this file in the same folder as main.py
