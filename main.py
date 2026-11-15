@@ -21,8 +21,8 @@ try:
 except ImportError:  # the core can still be imported without tkinter (for tests)
     tk = None
 
-from mapping import build_spans, effective_chips_per_universe
-from plsq import PlsqWriter, build_meta
+from mapping import build_spans, count_universes, effective_chips_per_universe
+from plsq import PlsqWriter, build_meta, encoded_meta_size
 from session import (
     ARTNET_ID, OP_DMX, OP_SYNC, RCVBUF_SIZE,
     parse_artdmx, postprocess, _blend_frames, write_json, _LUT,
@@ -161,12 +161,8 @@ class App(tk.Tk if tk else object):
         self._approved = None
         self._was_recording = False
         self._job = None
-        # PLSQ streaming state
-        self._plsq_sw = None
-        self._plsq_writer = None
-        self._plsq_queue = None
-        self._plsq_part = None
-        self._plsq_target = None
+        self._plsq_session = None   # active PlsqRecordingSession (PLSQ only)
+        self._blend_warn = None     # D11 warning, cleared on new recording
         self._prev = (time.perf_counter(), 0, {})
         self._rates = (0.0, {})
         self._build()
@@ -529,6 +525,12 @@ class App(tk.Tk if tk else object):
         self._update_buttons()
 
     def _toggle_record(self):
+        # Stop active PLSQ session
+        if self._plsq_session is not None:
+            if self._plsq_session.state in ("waiting", "recording"):
+                self._plsq_session.request_stop()
+            return
+        # Stop active JSON recorder
         if self.rec.state in ("waiting", "recording"):
             self.rec.stop()
             return
@@ -575,17 +577,31 @@ class App(tk.Tk if tk else object):
         except ValueError as e:
             self._err(str(e))
             return
-        if not self._confirm_can_record():
+        path = self.path_var.get().strip()
+        # I-06: fmt_var is authoritative; path extension must match selected format
+        fmt = self.fmt_var.get()
+        ext = os.path.splitext(path)[1].lower()
+        if fmt == "plsq" and ext != ".plsq":
+            self._err(
+                "Path extension %r does not match the selected format PLSQ. "
+                "Change the path or the format." % (ext or "(none)",)
+            )
             return
-        # Preflight: if packets are already arriving, check for missing/unexpected universes
+        if fmt == "json" and ext != ".json":
+            self._err(
+                "Path extension %r does not match the selected format JSON. "
+                "Change the path or the format." % (ext or "(none)",)
+            )
+            return
+        is_plsq = (fmt == "plsq")
+        # I-04: run preflight BEFORE confirm dialog (avoids wasted confirm on bad universe state)
         ok, pf_msgs = self._preflight(spans)
         for msg in pf_msgs:
             self._err(msg)
         if not ok:
             return
-        # Determine output format from path extension
-        path = self.path_var.get().strip()
-        is_plsq = path.lower().endswith(".plsq")
+        if not self._confirm_can_record():
+            return
         # D3: JSON is not available for 3+ universes
         if not is_plsq and len(spans) >= 3:
             self._err(
@@ -593,8 +609,9 @@ class App(tk.Tk if tk else object):
                 "Use PLSQ format." % len(spans)
             )
             return
-        # For PLSQ: check for leftover .part file
+        eff_cpu = effective_chips_per_universe(m["chips_per_universe"])
         if is_plsq:
+            # For PLSQ: check for leftover .part file
             part = path + ".part"
             if os.path.exists(part) and self._approved != path_key(part):
                 choice = ask_choice(
@@ -605,65 +622,108 @@ class App(tk.Tk if tk else object):
                 )
                 if choice != "overwrite":
                     return
-        # For PLSQ: refuse if blend delay-line exceeds 1 GiB
-        if is_plsq and blend > 0:
-            delay_bytes = blend * stride
-            if delay_bytes > 1 << 30:
+            # For PLSQ: refuse if blend delay-line exceeds 1 GiB
+            if blend > 0:
+                delay_bytes = blend * stride
+                if delay_bytes > 1 << 30:
+                    self._err(
+                        "Loop blend delay line would use %.1f GiB (blend=%d x stride=%d). "
+                        "Reduce blend frames or chip count."
+                        % (delay_bytes / (1 << 30), blend, stride)
+                    )
+                    return
+            # I-05: pre-check meta size (PLSQ only)
+            meta_check = build_meta(
+                file_format="plsq",
+                recorder_version=APPV,
+                model_name=self.vars["model_name"].get().strip(),
+                model_chips_tag=self.vars["model_chips_tag"].get().strip(),
+                sequence_name=self.vars["sequence_name"].get().strip(),
+                sequence_version=self.vars["sequence_version"].get().strip(),
+                developer_notes=self.vars["developer_notes"].get().strip(),
+                fps=int(fps),
+                frame_count=999999999999,
+                frame_stride=stride,
+                start_universe=m["start_universe"],
+                start_channel=m["start_channel"],
+                chips_per_universe=eff_cpu,
+                universes_count=len(spans),
+                model_chips_count=chips,
+                post_skip_frames=999999999999,
+                post_loop_blend_frames=999999999999,
+                recorded_frames_raw=999999999999,
+                missing_frames=999999999999,
+                late_frames=999999999999,
+                partial_source_frames=999999999999,
+                lost_packets=999999999999,
+            )
+            meta_sz = encoded_meta_size(meta_check)
+            if meta_sz > 65536:
                 self._err(
-                    "Loop blend delay line would use %.1f GiB (blend=%d × stride=%d). "
-                    "Reduce blend frames or chip count." % (delay_bytes / (1 << 30), blend, stride)
+                    "Meta block too large: %d bytes (limit 65,536). "
+                    "Shorten the text fields (model name, sequence name, developer notes)."
+                    % meta_sz
                 )
                 return
-        # Build frame assembler (when "complete source frames" is on)
-        assembler = None
-        if self.complete_frames_var.get():
-            assembler = FrameAssembler()
-            assembler.start(spans, stride)
-        self.server.set_assembler(assembler)
         self._clear_errors()
+        self._blend_warn = None
         self.vars["sequence_frame_stride"].set(str(stride))
-        eff_cpu = effective_chips_per_universe(m["chips_per_universe"])
-        self._job = {
-            "final": final, "skip": skip, "blend": blend,
-            "is_plsq": is_plsq,
-            "start_universe": m["start_universe"],
-            "start_channel": m["start_channel"],
-            "channels_per_chip": m["channels_per_chip"],
-            "chips_per_universe": eff_cpu,
-            "universes_count": len(spans),
-            "model_chips_count": chips,
-        }
-        # Start the pipeline
-        out_queue = None
         if is_plsq:
-            part = path + ".part"
-            self._plsq_target = path
-            self._plsq_part = part
-            pw = PlsqWriter()
-            pw.open(part, chips, int(fps), m["start_universe"], m["start_channel"],
-                    eff_cpu)
-            self._plsq_writer = pw
-            q_size = max(300, int(2 * fps) + 20)
-            out_queue = queue.Queue(maxsize=q_size)
-            self._plsq_queue = out_queue
-            sw = PlsqStreamWriter(pw, skip, blend, stride)
-            sw.start(out_queue)
-            self._plsq_sw = sw
-        # I-03: reset sequence tracking and snapshot baseline at recording start
-        # so the inter-session gap and pre-recording losses don't appear in meta.
-        with self.server.lock:
-            self.server._seq_last.clear()
-        self._lost_packets_start = self.server.snapshot()[6]
-        self.rec.start(
-            spans,
-            stride,
-            fps,
-            max_frames=(skip + final + blend) if final else 0,
-            wait_first_packet=self.wait_var.get(),
-            assembler=assembler,
-            out_queue=out_queue,
-        )
-        self._was_recording = True
+            # I-08: delegate PLSQ recording lifecycle to PlsqRecordingSession
+            meta_extra = {
+                "recorder_version": APPV,
+                "model_name": self.vars["model_name"].get().strip(),
+                "model_chips_tag": self.vars["model_chips_tag"].get().strip(),
+                "sequence_name": self.vars["sequence_name"].get().strip(),
+                "sequence_version": self.vars["sequence_version"].get().strip(),
+                "developer_notes": self.vars["developer_notes"].get().strip(),
+                "channels_per_chip": m["channels_per_chip"],
+            }
+            self._plsq_session = PlsqRecordingSession(
+                self.server,
+                chips=chips, fps=fps, out_path=path,
+                spans=spans, stride=stride,
+                start_universe=m["start_universe"],
+                start_channel=m["start_channel"],
+                eff_cpu=eff_cpu,
+                skip=skip, blend=blend, final_frames=final,
+                wait_first_packet=self.wait_var.get(),
+                complete_frames=self.complete_frames_var.get(),
+                meta_extra=meta_extra,
+            )
+            self._plsq_session.start()
+            if self._plsq_session.state == "error":
+                self._err(self._plsq_session.error)
+                self._plsq_session = None
+                return
+        else:
+            # JSON: inline Recorder (in-memory frames)
+            assembler = None
+            if self.complete_frames_var.get():
+                assembler = FrameAssembler()
+                assembler.start(spans, stride)
+            self.server.set_assembler(assembler)
+            # I-03: reset sequence tracking and snapshot baseline at recording start
+            with self.server.lock:
+                self.server._seq_last.clear()
+            self._lost_packets_start = self.server.snapshot()[6]
+            self.rec.start(
+                spans, stride, fps,
+                max_frames=(skip + final + blend) if final else 0,
+                wait_first_packet=self.wait_var.get(),
+                assembler=assembler,
+                out_queue=None,
+            )
+            self._was_recording = True
+            self._job = {
+                "final": final, "skip": skip, "blend": blend,
+                "start_universe": m["start_universe"],
+                "start_channel": m["start_channel"],
+                "channels_per_chip": m["channels_per_chip"],
+                "chips_per_universe": eff_cpu,
+                "universes_count": len(spans),
+                "model_chips_count": chips,
+            }
         self._update_buttons()
 
     def _preflight(self, spans):
@@ -777,6 +837,7 @@ class App(tk.Tk if tk else object):
         return True
 
     def _finish_recording(self):
+        """Called when the JSON recorder (self.rec) completes. PLSQ is handled by _plsq_session."""
         self.server.set_assembler(None)
         self._was_recording = False
         self._update_buttons()
@@ -801,101 +862,29 @@ class App(tk.Tk if tk else object):
             "partial_source_frames": rec_partial,
             "lost_packets": lost_pkts,
         }
-        if job.get("is_plsq"):
-            self._finish_plsq(job, fps, mapping_fields, stats_fields)
-        else:
-            self._finish_json(job, fps, mapping_fields, stats_fields)
+        self._finish_json(job, fps, mapping_fields, stats_fields)
 
-    def _finish_plsq(self, job, fps, mapping_fields, stats_fields):
-        """Finalize a PLSQ streaming recording."""
-        sw = self._plsq_sw
-        pw = self._plsq_writer
-        part = self._plsq_part
-        target = self._plsq_target
-
-        q = self._plsq_queue
-        if q is not None:
-            try:
-                q.put(None, timeout=2.0)
-            except Exception:
-                pass
-        self._plsq_queue = None
-        if sw is not None:
-            sw.join(timeout=30.0)
-
-        self._plsq_sw = None
-        self._plsq_writer = None
-        self._plsq_part = None
-        self._plsq_target = None
-
-        if sw is not None and sw.error:
-            self._err(
-                "PLSQ writer error: %s — partial file kept at %s" % (sw.error, part)
-            )
-            try:
-                pw.abort()
-            except Exception:
-                pass
+    def _on_plsq_session_complete(self):
+        """Called from _refresh when _plsq_session reaches done or error state."""
+        sess = self._plsq_session
+        self._plsq_session = None
+        if sess.state == "error":
+            self._err(sess.error)
+            self._update_buttons()
             return
-
-        final = sw.frames_written if sw is not None else 0
-        if final == 0:
-            self._err(
-                "PLSQ recording produced 0 exported frames "
-                "(check skip/blend settings). Partial file kept at %s" % part
-            )
-            try:
-                pw.abort()
-            except Exception:
-                pass
-            return
-
-        blend_applied = min(job["blend"], final) if job["blend"] else 0
-        meta = build_meta(
-            file_format="plsq",
-            recorder_version=APPV,
-            model_name=self.vars["model_name"].get(),
-            model_chips_tag=self.vars["model_chips_tag"].get(),
-            sequence_name=self.vars["sequence_name"].get(),
-            sequence_version=self.vars["sequence_version"].get(),
-            developer_notes=self.vars["developer_notes"].get(),
-            fps=int(fps),
-            frame_count=final,
-            frame_stride=self.rec.stride,
-            post_skip_frames=job["skip"],
-            post_loop_blend_frames=blend_applied,
-            recorded_frames_raw=self.rec.frames_captured,
-            start_universe=mapping_fields["start_universe"],
-            start_channel=mapping_fields["start_channel"],
-            channels_per_chip=mapping_fields["channels_per_chip"],
-            chips_per_universe=mapping_fields["chips_per_universe"],
-            universes_count=mapping_fields["universes_count"],
-            model_chips_count=mapping_fields["model_chips_count"],
-            missing_frames=stats_fields["missing"],
-            late_frames=stats_fields["late"],
-            partial_source_frames=stats_fields["partial_source_frames"],
-            lost_packets=stats_fields["lost_packets"],
-        )
+        res = sess.result()
+        if res.get("blend_warning"):
+            self._blend_warn = res["blend_warning"]
         try:
-            pw.finalize(meta)
-        except Exception as e:
-            self._err(
-                "PLSQ finalize error: %s — partial file kept at %s" % (e, part)
-            )
-            return
-        try:
-            os.replace(part, target)
-        except OSError as e:
-            self._err(
-                "Could not rename %s → %s: %s" % (part, target, e)
-            )
-            return
-        size = os.path.getsize(target)
+            size = os.path.getsize(res["path"])
+        except OSError:
+            size = 0
         self.last_saved = "Saved: %s\n%d frames, %.1f MB" % (
-            target, final, size / (1024 * 1024)
+            res["path"], res["frames_written"], size / (1024 * 1024)
         )
-        self.saved_path = target
+        self.saved_path = res["path"]
         self._approved = None
+        self._update_buttons()
 
     def _finish_json(self, job, fps, mapping_fields, stats_fields):
         """Finalize a JSON (in-memory) recording."""
@@ -910,8 +899,27 @@ class App(tk.Tk if tk else object):
             else avail - job["blend"]
         )
         base = {"fps": fps, "stride": self.rec.stride, "recorded": len(raw)}
+        if final <= 0:
+            self.pending = dict(base, frames=list(raw), skip=0, blend=0,
+                                **mapping_fields, **stats_fields)
+            self._err(
+                "Not enough recorded frames (have %d after skip, need at least %d). "
+                "Raw recording kept in memory." % (avail, job["blend"] + 1)
+            )
+            self.last_saved = (
+                "Not saved: the raw recording (%d frames) is kept in memory.\n"
+                "Start Record will offer to save it." % len(raw)
+            )
+            return
+        # D11: clamp blend if fewer exported frames than requested
+        blend_applied = min(job["blend"], final)
+        if blend_applied < job["blend"]:
+            self._blend_warn = (
+                "Loop blend reduced from %d to %d frames: the recording is too short"
+                % (job["blend"], blend_applied)
+            )
         try:
-            frames = postprocess(raw, job["skip"], job["blend"], final)
+            frames = postprocess(raw, job["skip"], blend_applied, final)
         except ValueError as e:
             self.pending = dict(base, frames=list(raw), skip=0, blend=0,
                                 **mapping_fields, **stats_fields)
@@ -923,7 +931,8 @@ class App(tk.Tk if tk else object):
             return
         self.vars["sequence_frame_count"].set(str(len(frames)))
         self.vars["sequence_duration_sec"].set(str(round(len(frames) / fps, 3)))
-        self.pending = dict(base, frames=frames, skip=job["skip"], blend=job["blend"],
+        # Store blend_applied so post_loop_blend_frames in meta reflects actual blend
+        self.pending = dict(base, frames=frames, skip=job["skip"], blend=blend_applied,
                             **mapping_fields, **stats_fields)
         self._save_pending()
 
@@ -1000,22 +1009,48 @@ class App(tk.Tk if tk else object):
     def _update_buttons(self):
         running = self.server.running
         addr = "(%s) UDP: %s" % (self.host_var.get(), self.port_var.get())
-        self.btn_server.config(
-            text=("Stop Server\n" if running else "Start Server\n") + addr,
-            bg=RED if running else BTN,
-            activebackground=RED if running else BTN_HOVER,
-            highlightbackground=RED_BORDER if running else BORDER,
+        sess = self._plsq_session
+        is_finalizing = sess is not None and sess.state == "finalizing"
+        active = (
+            self.rec.state in ("waiting", "recording")
+            or (sess is not None and sess.state in ("waiting", "recording"))
         )
-        rec = self.rec.state in ("waiting", "recording")
-        self.btn_rec.config(
-            text="Stop Record\nInput Data" if rec else "Start Record\nInput Data",
-            bg=RED if rec else BTN,
-            activebackground=RED if rec else BTN_HOVER,
-            highlightbackground=RED_BORDER if rec else BORDER,
-            state="normal" if (running or rec) else "disabled",
-        )
+        if is_finalizing:
+            self.btn_server.config(
+                text=("Stop Server\n" if running else "Start Server\n") + addr,
+                bg=RED if running else BTN,
+                activebackground=RED if running else BTN_HOVER,
+                highlightbackground=RED_BORDER if running else BORDER,
+                state="disabled",
+            )
+            self.btn_rec.config(
+                text="Finalizing...",
+                bg=BTN,
+                activebackground=BTN_HOVER,
+                highlightbackground=BORDER,
+                state="disabled",
+            )
+        else:
+            self.btn_server.config(
+                text=("Stop Server\n" if running else "Start Server\n") + addr,
+                bg=RED if running else BTN,
+                activebackground=RED if running else BTN_HOVER,
+                highlightbackground=RED_BORDER if running else BORDER,
+                state="normal",
+            )
+            self.btn_rec.config(
+                text="Stop Record\nInput Data" if active else "Start Record\nInput Data",
+                bg=RED if active else BTN,
+                activebackground=RED if active else BTN_HOVER,
+                highlightbackground=RED_BORDER if active else BORDER,
+                state="normal" if (running or active) else "disabled",
+            )
 
     def _close(self):
+        if self._plsq_session is not None:
+            if self._plsq_session.state in ("waiting", "recording", "finalizing"):
+                self._plsq_session.abort()
+            self._plsq_session = None
         if self.rec.state in ("waiting", "recording"):
             self.rec.stop()
         if self._was_recording and self.rec.state == "done":
@@ -1045,32 +1080,42 @@ class App(tk.Tk if tk else object):
 
     # ---- statistics ----------------------------------------------------------
     def _refresh(self):
+        # I-08: poll PLSQ session state machine
+        if self._plsq_session is not None:
+            self._plsq_session.poll()
+            if self._plsq_session.state in ("done", "error"):
+                self._on_plsq_session_complete()
+
         if self.server.error:
             self._err(self.server.error)
             self.server.error = None
         if self.rec.error:
             self._err(self.rec.error)
             self.rec.error = None
-        if self._plsq_sw is not None and self._plsq_sw.error:
-            self._err("PLSQ writer: %s" % self._plsq_sw.error)
+        if not self.server.running:
             if self.rec.state in ("waiting", "recording"):
                 self.rec.stop()
-        if not self.server.running and self.rec.state in ("waiting", "recording"):
-            self.rec.stop()
+            if self._plsq_session is not None and self._plsq_session.state in ("waiting", "recording"):
+                self._plsq_session.request_stop()
         if self._was_recording and self.rec.state == "done":
             self._finish_recording()
+
         # Live derived fields
         try:
             chips = int(self.vars["model_chips_count"].get())
             cpc = int(self.map_vars["channels_per_chip"].get())
             cpu_raw = int(self.map_vars["chips_per_universe"].get())
             eff_cpu = effective_chips_per_universe(cpu_raw)
-            n_uni = (chips + eff_cpu - 1) // eff_cpu
+            # I-07: use count_universes (accounts for start_channel) instead of ceil formula
+            su = int(self.map_vars["start_universe"].get())
+            sc = int(self.map_vars["start_channel"].get())
+            n_uni = count_universes(su, sc, cpu_raw, chips)
             self.universes_var.set(str(n_uni))
             self.eff_cpu_var.set(
                 "auto → %d" % eff_cpu if cpu_raw == 0 else str(eff_cpu)
             )
-            if self.rec.state not in ("waiting", "recording"):
+            rec_idle = self.rec.state not in ("waiting", "recording") and self._plsq_session is None
+            if rec_idle:
                 self._set_ro("sequence_frame_stride", str(chips * cpc))
                 dur = float(
                     self.vars["sequence_duration_sec"].get().replace(",", ".") or 0
@@ -1084,7 +1129,8 @@ class App(tk.Tk if tk else object):
         except (ValueError, ZeroDivisionError):
             self.universes_var.set("?")
             self.eff_cpu_var.set("")
-        # JSON format: disable radio when 3+ universes
+
+        # JSON format: disable radio when 3+ universes (using corrected count)
         try:
             n_uni_str = self.universes_var.get()
             if n_uni_str and n_uni_str != "?":
@@ -1097,6 +1143,7 @@ class App(tk.Tk if tk else object):
                     self._json_radio.config(state="normal")
         except (ValueError, AttributeError):
             pass
+
         latest, ustats, total, ignored, nbytes, last, lost_pkts, rcvbuf = self.server.snapshot()
         now = time.perf_counter()
         pt, pn, pu = self._prev
@@ -1162,57 +1209,87 @@ class App(tk.Tk if tk else object):
         else:
             L.append(("Server: STOPPED", None))
         L.append(("", None))
-        st = self.rec.state
-        is_plsq = self._job is not None and self._job.get("is_plsq")
-        if st == "waiting":
-            L.append(("Recording: waiting for the first packet...", None))
-        elif st == "recording":
-            tgt = ("/%d" % self.rec.max_frames) if self.rec.max_frames else ""
-            fc = self.rec.frames_captured
-            if is_plsq:
-                sw = self._plsq_sw
-                q = self._plsq_queue
-                written = sw.bytes_written if sw else 0
-                q_depth = q.qsize() if q else 0
+
+        # Recording status display
+        sess = self._plsq_session
+        if sess is not None:
+            # PLSQ session display
+            sess_state = sess.state
+            if sess_state == "waiting":
+                L.append(("Recording: waiting for the first packet...", None))
+            elif sess_state == "recording":
+                rec = sess.recorder
+                if rec is not None:
+                    fc = rec.frames_captured
+                    tgt = ("/%d" % rec.max_frames) if rec.max_frames else ""
+                    L.append((
+                        "REC PLSQ  %d%s frames  (%.2f s)  queue: %d  written: %.1f MB"
+                        % (fc, tgt, rec.elapsed, sess.queue_size,
+                           sess.bytes_written / (1024 * 1024)),
+                        None,
+                    ))
+                    if sess.skip or sess.blend:
+                        L.append((
+                            "plan: skip %d + export %s + blend %d"
+                            % (sess.skip, sess.final_frames or "?", sess.blend),
+                            None,
+                        ))
+                    partial = rec.partial_source_frames
+                    L.append((
+                        "missing: %d   late: %d   partial_src: %d"
+                        % (rec.missing, rec.late, partial),
+                        None,
+                    ))
+            elif sess_state == "finalizing":
                 L.append((
-                    "REC PLSQ  %d%s frames  (%.2f s)  queue: %d  written: %.1f MB"
-                    % (fc, tgt, self.rec.elapsed, q_depth, written / (1024 * 1024)),
+                    "Finalizing PLSQ... (written %.1f MB)"
+                    % (sess.bytes_written / (1024 * 1024),),
                     None,
                 ))
-            else:
+        else:
+            # JSON recorder display
+            st = self.rec.state
+            if st == "waiting":
+                L.append(("Recording: waiting for the first packet...", None))
+            elif st == "recording":
+                tgt = ("/%d" % self.rec.max_frames) if self.rec.max_frames else ""
                 L.append((
                     "REC  %d%s frames  (%.2f s)"
                     % (len(self.rec.frames), tgt, self.rec.elapsed),
                     None,
                 ))
-            if self._job and (self._job["skip"] or self._job["blend"]):
+                if self._job and (self._job["skip"] or self._job["blend"]):
+                    L.append((
+                        "plan: skip %d + export %s + blend %d"
+                        % (self._job["skip"], self._job["final"] or "?", self._job["blend"]),
+                        None,
+                    ))
+                partial = self.rec.partial_source_frames
                 L.append((
-                    "plan: skip %d + export %s + blend %d"
-                    % (self._job["skip"], self._job["final"] or "?", self._job["blend"]),
+                    "missing: %d   late: %d   partial_src: %d"
+                    % (self.rec.missing, self.rec.late, partial),
                     None,
                 ))
-            partial = self.rec.partial_source_frames
-            L.append((
-                "missing: %d   late: %d   partial_src: %d"
-                % (self.rec.missing, self.rec.late, partial),
-                None,
-            ))
-        elif st == "done":
-            partial = self.rec.partial_source_frames
-            fc = self.rec.frames_captured
-            L.append((
-                "Recorded: %d frames  missing: %d  late: %d  partial_src: %d"
-                % (fc if is_plsq else len(self.rec.frames), self.rec.missing, self.rec.late, partial),
-                None,
-            ))
-            if self.rec.missing:
+            elif st == "done":
+                partial = self.rec.partial_source_frames
+                fc = len(self.rec.frames)
                 L.append((
-                    "Warning: some frames had no data for a universe from Input mapping.",
-                    "warn",
+                    "Recorded: %d frames  missing: %d  late: %d  partial_src: %d"
+                    % (fc, self.rec.missing, self.rec.late, partial),
+                    None,
                 ))
+                if self.rec.missing:
+                    L.append((
+                        "Warning: some frames had no data for a universe from Input mapping.",
+                        "warn",
+                    ))
+
         if self.last_saved:
             L.append(("", None))
             L.extend((line, None) for line in self.last_saved.split("\n"))
+        if self._blend_warn:
+            L.append(("", None))
+            L.append((self._blend_warn, "warn"))
         if self.errors:
             L.append(("", None))
             L.append(("Errors:", "err"))
