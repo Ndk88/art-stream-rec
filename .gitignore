@@ -3,4 +3,4 @@ __pycache__/
 *.json
 *.plsq
 *.part
-!tests/golden/conformance_v1.plsq
+!tests/golden/conformance_v1.plsq.bench_out/

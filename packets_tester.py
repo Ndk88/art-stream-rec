@@ -111,8 +111,15 @@ def _precompute_packets(spans, ring):
 # ---------------------------------------------------------------------------
 
 def _send_loop(spans, ring_pkts, ring_size, sock, addr, fps, duration,
-               stagger_sec, use_artsync, t0, log_fn=None):
-    """Drift-free send loop. Returns (sent, send_errors)."""
+               stagger_sec, use_artsync, t0, log_fn=None, counters=None,
+               worker_counters=()):
+    """Drift-free send loop. Returns (sent, send_errors).
+
+    counters: optional (sent_value, errors_value) shared multiprocessing.Value
+    pair, updated once per frame (worker processes report through it).
+    worker_counters: list of such pairs from the worker processes; the main
+    process prints their running totals together with its own periodic line.
+    """
     seqs = [1] * len(spans)   # per-span sequence numbers, 1..255 wrapping, skip 0
     period = 1.0 / fps
     lag_warn = period * 1.5    # warn if >1.5 periods late
@@ -170,6 +177,9 @@ def _send_loop(spans, ring_pkts, ring_size, sock, addr, fps, duration,
                 errors += 1
 
         n += 1
+        if counters is not None:
+            counters[0].value = sent
+            counters[1].value = errors
 
         # Periodic log (main process only)
         if log_fn:
@@ -180,6 +190,11 @@ def _send_loop(spans, ring_pkts, ring_size, sock, addr, fps, duration,
                     "sent %d (%.1f pkt/s x %d uni) | total %d | send errors %d (+%d)"
                     % (win_sent, win_sent / elapsed, len(spans), sent, errors, win_errors)
                 )
+                for k, (w_sent, w_err) in enumerate(worker_counters, 1):
+                    log_fn(
+                        "Worker %d | total %d | send errors %d"
+                        % (k, w_sent.value, w_err.value)
+                    )
                 win_sent = win_errors = 0
                 win_start = now
 
@@ -195,15 +210,18 @@ def _send_loop(spans, ring_pkts, ring_size, sock, addr, fps, duration,
 # ---------------------------------------------------------------------------
 
 def _worker_entry(spans, pattern, chips, stride, ring_size, addr, fps,
-                  duration, stagger_ms, t0):
-    """Entry point for worker processes spawned by --procs."""
+                  duration, stagger_ms, t0, counters=None):
+    """Entry point for worker processes spawned by --procs.
+
+    Worker stdout is not reliably connected to the parent's pipe on Windows,
+    so the worker reports its packet counts through `counters` instead."""
     ring = _build_ring(pattern, chips, stride, ring_size)
     ring_pkts = _precompute_packets(spans, ring)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         _send_loop(
             spans, ring_pkts, ring_size, sock, addr, fps, duration,
-            stagger_ms / 1000.0, False, t0,
+            stagger_ms / 1000.0, False, t0, counters=counters,
         )
     except KeyboardInterrupt:
         pass
@@ -312,16 +330,20 @@ def main(argv=None):
     t0 = time.perf_counter() + startup_secs
 
     workers = []
+    worker_counters = []
     if args.procs > 1:
         n_procs = min(args.procs, universes_count)
         g = (universes_count + n_procs - 1) // n_procs
         groups = [spans[i:i + g] for i in range(0, universes_count, g)]
         # spawn all but the last group as worker processes
         for grp in groups[:-1]:
+            ctr = (multiprocessing.Value("q", 0, lock=False),
+                   multiprocessing.Value("q", 0, lock=False))
+            worker_counters.append(ctr)
             p = multiprocessing.Process(
                 target=_worker_entry,
                 args=(grp, args.pattern, chips, stride, ring_size,
-                      addr, fps, args.duration, args.stagger_ms, t0),
+                      addr, fps, args.duration, args.stagger_ms, t0, ctr),
                 daemon=True,
             )
             p.start()
@@ -347,15 +369,24 @@ def main(argv=None):
         sent, errors = _send_loop(
             main_spans, ring_pkts, ring_size, sock, addr, fps, args.duration,
             args.stagger_ms / 1000.0, use_artsync, t0, log_fn=_log,
+            worker_counters=worker_counters,
         )
     except KeyboardInterrupt:
         pass
     finally:
         sock.close()
+        # Workers stop on their own after --duration; give them time to finish
+        # so their final counts are exact, then terminate whatever is left.
+        grace = 5.0 if args.duration > 0 else 0.0
         for p in workers:
-            p.terminate()
-            p.join(timeout=1.0)
+            p.join(timeout=grace)
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=1.0)
 
+    for k, (w_sent, w_err) in enumerate(worker_counters, 1):
+        _log("Stopped. Worker %d sent %d packets, %d send errors."
+             % (k, w_sent.value, w_err.value))
     _log("Stopped. Main process sent %d packets, %d send errors." % (sent, errors))
     return 0
 

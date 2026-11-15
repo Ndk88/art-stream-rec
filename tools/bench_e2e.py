@@ -21,6 +21,9 @@ Options:
   --skip N           Skip first N frames.
   --blend N          Loop-blend N frames.
   --out-dir DIR      Where to write .plsq files (default: system temp).
+
+recv % = packets counted by ArtNetServer over the whole run / packets sent by
+all tester processes (sum of each process's final count). n/a if unparseable.
   --matrix           Run all 6 standard matrix points + 2 extra runs.
   --quick            Use 10 s instead of --duration for each run.
   --no-content-check Skip per-frame content validation (fast path for large chips).
@@ -46,6 +49,7 @@ from session import ArtNetServer, PlsqRecordingSession
 PYTHON = sys.executable
 HOST = "127.0.0.1"
 PORT = 6454
+TESTER_EXIT_TIMEOUT = 20.0  # seconds to wait for the tester after recording
 
 # ---- Windows memory / CPU helpers ------------------------------------------
 
@@ -136,18 +140,44 @@ def _drive_free_gb(path):
 
 # ---- tester subprocess helpers ---------------------------------------------
 
-def _parse_sent(text):
-    """Parse total sent packets from tester output.
+_RE_FINAL = re.compile(r"Stopped\. (Main process|Worker (\d+)) sent (\d+) packets")
+_RE_WORKER_TOTAL = re.compile(r"Worker (\d+) \| total (\d+) \|")
+_RE_MAIN_TOTAL = re.compile(r"\bsent \d+ \(.*\| total (\d+) \|")
+_RE_PROCS = re.compile(r"Multi-process: (\d+) processes")
 
-    Prefers the 'Stopped … sent N packets' final line; falls back to the
-    maximum 'total N' seen in periodic stat lines (accurate for single-process;
-    per-process only for multi-process runs — multiply by proc count yourself).
+
+def _parse_sent(text):
+    """Total packets sent by ALL tester processes, or None if not parseable.
+
+    For each process (main + workers) take its final 'Stopped. ... sent N
+    packets' value; if a process has no final line, take its last periodic
+    'total N'. Sum over processes. Returns None when no process could be
+    parsed, or when the tester announced N processes and fewer were found.
     """
-    m = re.search(r"sent (\d+) packets", text)
-    if m:
-        return int(m.group(1))
-    totals = [int(v) for v in re.findall(r"\| total (\d+) \|", text)]
-    return max(totals) if totals else None
+    final = {}
+    last_total = {}
+    expected = 1
+    for line in text.splitlines():
+        m = _RE_FINAL.search(line)
+        if m:
+            key = "main" if m.group(2) is None else "w" + m.group(2)
+            final[key] = int(m.group(3))
+            continue
+        m = _RE_WORKER_TOTAL.search(line)
+        if m:
+            last_total["w" + m.group(1)] = int(m.group(2))
+            continue
+        m = _RE_MAIN_TOTAL.search(line)
+        if m:
+            last_total["main"] = int(m.group(1))
+            continue
+        m = _RE_PROCS.search(line)
+        if m:
+            expected = int(m.group(1))
+    keys = set(final) | set(last_total)
+    if not keys or len(keys) < expected:
+        return None
+    return sum(final.get(k, last_total.get(k, 0)) for k in keys)
 
 
 def _start_tester(chips, fps, duration, artsync, stagger_ms, n_uni):
@@ -281,9 +311,6 @@ def run_one(chips, fps, duration, out_dir, complete_frames=True,
             time.perf_counter() - t_wait, PORT
         ))
 
-    # Snapshot server counter at start
-    pkts_at_start = server.snapshot()[2]
-
     # Create session
     meta_extra = dict(
         recorder_version="bench_e2e",
@@ -398,14 +425,24 @@ def run_one(chips, fps, duration, out_dir, complete_frames=True,
     cpu1 = _cpu_seconds()
     mem1 = _mem_bytes()
 
-    # Stop tester and collect buffered output
-    _stop_tester(tester)
+    # Let the tester finish its --duration so every process prints its final
+    # count; terminate only if it does not exit in time (then the parser falls
+    # back to the last periodic totals).
+    try:
+        tester.wait(timeout=TESTER_EXIT_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        _log("WARNING: tester still running after %.0f s, terminating"
+             % TESTER_EXIT_TIMEOUT)
+        _stop_tester(tester)
     tester_reader.join(timeout=3.0)
     with tester_lock:
         tester_out = "\n".join(tester_buf)
     pkts_sent  = _parse_sent(tester_out)
+    time.sleep(0.5)  # let the server drain its socket buffer
     snapshot   = server.snapshot()
-    pkts_recv  = snapshot[2] - pkts_at_start
+    # The server was started before the tester, so its counter covers every
+    # packet of the run (same window as the tester's sent count).
+    pkts_recv  = snapshot[2]
     server.stop()
 
     if session.state == "error":
@@ -460,9 +497,9 @@ def run_one(chips, fps, duration, out_dir, complete_frames=True,
     file_mb = os.path.getsize(out_path) / (1024 * 1024) if os.path.exists(out_path) else 0
 
     _log("--- Results: %s ---" % label)
-    _log("  Sent/Received  : %s / %d  ratio=%.4f" % (
-        str(pkts_sent) if pkts_sent else "?", pkts_recv,
-        recv_ratio if recv_ratio else 0.0
+    _log("  Sent/Received  : %s / %d  recv=%s" % (
+        str(pkts_sent) if pkts_sent is not None else "n/a", pkts_recv,
+        ("%.2f%%" % (100.0 * recv_ratio)) if recv_ratio is not None else "n/a"
     ))
     _log("  lost_packets   : %d" % res["lost_packets"])
     _log("  late_frames    : %d (%.2f%%)" % (res["late_frames"], late_pct))
@@ -536,10 +573,11 @@ def _print_table(results):
         if r.get("error"):
             _log("%-26s  ERROR: %s" % (r["label"], r["error"]))
             continue
-        _log("%-26s %7s %5.1f%% %8d %6.2f%% %6.2f%% %8d %5.0f%% %6s" % (
+        recv = r["recv_ratio"]
+        _log("%-26s %7s %6s %8d %6.2f%% %6.2f%% %8d %5.0f%% %6s" % (
             r["label"],
-            str(r["pkts_sent"]) if r["pkts_sent"] else "?",
-            (r["recv_ratio"] or 0.0) * 100.0,
+            str(r["pkts_sent"]) if r["pkts_sent"] is not None else "n/a",
+            ("%.1f%%" % (recv * 100.0)) if recv is not None else "n/a",
             r["lost_packets"],
             r["late_pct"],
             r["missing_pct"],
