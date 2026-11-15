@@ -137,13 +137,18 @@ class TestFirstFrameRace(unittest.TestCase):
                                 % (i, chips, fill))
 
     def test_stress_500_universes_no_black_first_frame(self):
-        """High universe-count stress: 500 universes, 10 iterations."""
+        """Mock-based assembler stress: 500 universes, 50 iterations.
+
+        Uses _MockServer (latest is always empty), so the old any-in-latest
+        wait would hang forever.  Tests that the fix (wait for committed_frame)
+        works correctly.  For the real UDP race see tools/stress_first_frame.py.
+        """
         chips = 64000  # 500 universes
         spans  = _spans_for(chips)
         stride = chips * 4
         FILL   = 0xCC
 
-        for i in range(10):
+        for i in range(50):
             fa     = FrameAssembler()
             fa.start(spans, stride)
             server = _MockServer()

@@ -711,6 +711,11 @@ class PlsqRecordingSession:
             self.error = "Could not open recording file: %s" % exc
             return
 
+        # Reset per-universe sequence tracking so the gap between pre-recording
+        # and recording packets does not create false in-recording loss counts.
+        with self._server.lock:
+            self._server._seq_last.clear()
+
         # Snapshot lost_packets baseline at recording start
         self._lost_packets_start = self._server.snapshot()[6]
 

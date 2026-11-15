@@ -493,5 +493,95 @@ class TestStaggerWithArtSync(unittest.TestCase):
         self.assertIsNotNone(asm.committed_frame, "at least one frame must have been committed")
 
 
+# ---------------------------------------------------------------------------
+# I-10: short-packet zero-fill and counter
+# ---------------------------------------------------------------------------
+
+class TestShortPacketHandling(unittest.TestCase):
+    """I-10: packets covering fewer DMX channels than mapped are zero-filled."""
+
+    CHIPS = 128  # exactly 1 universe, 512 DMX channels (128 chips × 4)
+
+    def setUp(self):
+        spans = _spans_for(self.CHIPS)
+        self.fa = FrameAssembler()
+        self.fa.start(spans, self.CHIPS * 4)
+        self.uni = spans[0][0]
+        self.stride = self.CHIPS * 4
+
+    def _deliver_short(self, universe, data):
+        """Deliver a packet whose declared dmx_len < stride."""
+        pkt = bytearray(_make_artdmx(universe, data))
+        mv = memoryview(pkt)
+        # Pass only len(data) as dmx_len even though mapping needs 512
+        self.fa.on_universe(universe, mv, len(pkt), len(data))
+
+    def test_short_packet_first_channels_copied(self):
+        """First 100 channels are copied; channels 100-511 are zeroed."""
+        # Pre-fill working buffer with non-zero data via a full packet
+        full_data = bytes([0xFF] * self.stride)
+        pkt = bytearray(_make_artdmx(self.uni, full_data))
+        mv = memoryview(pkt)
+        self.fa.on_universe(self.uni, mv, len(pkt), self.stride)
+        self.assertIsNotNone(self.fa.committed_frame)
+        self.assertEqual(self.fa.short_packets, 0)
+
+        # Now feed a short packet (100 channels) on a fresh frame
+        self.fa._updated = set()   # reset so next full set commits
+        short_fill = bytes([0xAA] * 100)
+        self._deliver_short(self.uni, short_fill)
+
+        frame = self.fa.committed_frame
+        self.assertIsNotNone(frame)
+        # First 100 bytes must be 0xAA
+        self.assertEqual(frame[:100], bytes([0xAA] * 100),
+                         "First 100 channels must be copied from short packet")
+        # Remaining 412 bytes must be zeroed (zero-fill overwrites previous 0xFF)
+        self.assertEqual(frame[100:], bytes(self.stride - 100),
+                         "Channels 100-511 must be zeroed after short packet")
+
+    def test_short_packet_increments_counter(self):
+        """short_packets increments and first_short_uni is set on the first short packet."""
+        self.assertEqual(self.fa.short_packets, 0)
+        self.assertIsNone(self.fa.first_short_uni)
+
+        self._deliver_short(self.uni, bytes([0x11] * 100))
+        self.assertEqual(self.fa.short_packets, 1)
+        self.assertEqual(self.fa.first_short_uni, self.uni)
+
+        # Second short packet: counter increments, first_short_uni unchanged
+        self.fa._updated = set()
+        self._deliver_short(self.uni, bytes([0x22] * 50))
+        self.assertEqual(self.fa.short_packets, 2)
+        self.assertEqual(self.fa.first_short_uni, self.uni,
+                         "first_short_uni must be the first universe that was short")
+
+    def test_short_packet_marks_universe_updated(self):
+        """A short packet still marks the universe as updated (counts toward full frame)."""
+        self._deliver_short(self.uni, bytes([0x33] * 100))
+        # For a single-universe layout, this triggers a full commit
+        self.assertIsNotNone(self.fa.committed_frame,
+                             "Universe must be marked updated even for short packets")
+
+    def test_full_packet_does_not_increment_counter(self):
+        """A correctly sized packet must not change short_packets."""
+        full = bytes([0x44] * self.stride)
+        pkt = bytearray(_make_artdmx(self.uni, full))
+        mv = memoryview(pkt)
+        self.fa.on_universe(self.uni, mv, len(pkt), self.stride)
+        self.assertEqual(self.fa.short_packets, 0)
+        self.assertIsNone(self.fa.first_short_uni)
+
+    def test_start_resets_counters(self):
+        """start() resets short_packets and first_short_uni."""
+        self._deliver_short(self.uni, bytes(50))
+        self.assertEqual(self.fa.short_packets, 1)
+        # Restart assembler
+        spans = _spans_for(self.CHIPS)
+        self.fa.start(spans, self.stride)
+        self.assertEqual(self.fa.short_packets, 0)
+        self.assertIsNone(self.fa.first_short_uni)
+
+
 if __name__ == "__main__":
     unittest.main()

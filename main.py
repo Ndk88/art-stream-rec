@@ -649,8 +649,10 @@ class App(tk.Tk if tk else object):
             sw = PlsqStreamWriter(pw, skip, blend, stride)
             sw.start(out_queue)
             self._plsq_sw = sw
-        # I-03: snapshot lost_packets at recording start so pre-recording losses
-        # don't appear in the file meta.
+        # I-03: reset sequence tracking and snapshot baseline at recording start
+        # so the inter-session gap and pre-recording losses don't appear in meta.
+        with self.server.lock:
+            self.server._seq_last.clear()
         self._lost_packets_start = self.server.snapshot()[6]
         self.rec.start(
             spans,
