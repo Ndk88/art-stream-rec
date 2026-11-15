@@ -27,6 +27,7 @@ Do not change these without asking the user.
 | D8 | Every field the recorder knows about a sequence (everything except the data bytes) is stored in the file meta, with the same keys in JSON and `.plsq`, and is readable from Blueprint as a struct and as a JSON string (to forward over Pixel Streaming to a React frontend). |
 | D9 | `chips_per_universe`: the UI default is `0` = auto (128 for RGBW). Files always store the **effective** value (never `0`). The user can override it to match the patch of the source. |
 | D10 | Playback is time-based: frame index = floor(time x fps). Normalization: byte / 255 is treated as a linear value, as in the existing pipeline (Make Linear Color). |
+| D11 | When a recording is stopped early and the number of exported frames (`final`) is less than the requested loop-blend length (`blend`), the recorder applies a shortened blend `blend_applied = min(blend, final)` in both formats (PLSQ and JSON), writes `blend_applied` to `post_loop_blend_frames`, and shows a persistent warning line in the statistics block: *"Loop blend reduced from X to Y frames: the recording is too short"*. This is not an error. If `final <= 0` it remains an error and nothing is saved (PLSQ: `.part` file kept; JSON: raw recording kept in memory). |
 
 ## 3. Scale reference (RGBW, 4 bytes per chip)
 
