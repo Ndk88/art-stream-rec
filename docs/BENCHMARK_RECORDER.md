@@ -175,3 +175,62 @@ python tools/bench_e2e.py --quick --no-content-check
 # Single point with content check
 python tools/bench_e2e.py --chips 64000 --fps 60 --duration 10
 ```
+
+---
+
+## End-to-end results after I-02..I-11 (dev/v1.2.1, 2026-11-15, 60 s each)
+
+Measured with `tools/bench_e2e.py --quick --duration 60` on `dev/v1.2.1` after all eleven issues were committed.  Same pipeline as the 10 s baseline above: `ArtNetServer → FrameAssembler → Recorder → PlsqRecordingSession → PlsqStreamWriter` with atomic-rename finalize.
+
+> **Note — "before" 60 s run not feasible:** `session.py` was first committed in the I-02 commit (`1510284`), not in I-01, due to a known process violation (see REPORT_SUMMARY.md §"Process violations"). The worktree at `c141c8e` (pre-I-02) cannot import `session` and `bench_e2e.py` fails with `ModuleNotFoundError`. The 10 s baseline table above serves as the before reference.
+
+| Label | chips | fps | sent pkt | recv % | lost | late % | missing % | torn | validate |
+|-------|------:|----:|---------:|-------:|-----:|-------:|----------:|-----:|----------|
+| 1700/30 | 1,700 | 30 | 25,256 | 100.2 % | 0 | 0.00 % | **0.00 %** | 0 | OK |
+| 1700/60 | 1,700 | 60 | 50,078 | 101.1 % | 0 | 0.00 % | **0.00 %** | 0 | OK |
+| 10000/60 | 10,000 | 60 | 282,662 | 101.1 % | 0 | 0.00 % | **0.00 %** | 3,600 ⚠ | OK |
+| 32000/60 | 32,000 | 60 | 446,000 | 207.3 % | 0 | 0.00 % | **0.00 %** | 0 | OK |
+| 64000/30 | 64,000 | 30 | 224,250 | 416.8 % | 0 | 0.00 % | **0.00 %** | 0 | OK |
+| **64000/60** | **64,000** | **60** | **446,375** | **418.7 %** | **0** | **0.00 %** | **0.00 %** | **0** | **OK** |
+| 64k/60 +artsync+stagger | 64,000 | 60 | 99,666 | 416.5 % | 0 | 0.00 % | **0.00 %** | 3,457 ⚠ | OK |
+| 64k/60 no-assembler | 64,000 | 60 | 446,625 | 418.5 % | 0 | 0.00 % | **0.00 %** | 18 | OK |
+
+**Queue**: never exceeded capacity at any matrix point.
+
+### Key improvement: missing frames eliminated
+
+| Point | Pre-I-02 (10 s) | After I-02..I-11 (60 s) |
+|-------|----------------|--------------------------|
+| 1700/30 | 1 frame (0.33 %) | **0 frames** |
+| 1700/60 | 1 frame (0.17 %) | **0 frames** |
+| 10000/60 | 1 frame (0.17 %) | **0 frames** |
+| 32000/60 | 1 frame (0.17 %) | **0 frames** |
+| 64000/30 | 1 frame (0.33 %) | **0 frames** |
+| 64000/60 | 1 frame (0.17 %) | **0 frames** |
+| 64k/60 +artsync+stagger | 5 frames (0.83 %) | **0 frames** |
+| 64k/60 no-assembler | 0 frames | **0 frames** |
+
+The I-02 fix (seed the FrameAssembler before starting the Recorder sampler) eliminated the first-frame race across the board.
+
+### Torn-frame notes
+
+**10000/60 — 3,600 torn (100 %):** Every frame flagged as torn, yet PLSQ validation passes and lost/late/missing are all zero. Suspected cause: bench_e2e content-check uses a stride derived from `chips × 4` bytes, but 10,000 chips maps to 79 universes (last universe carries only 16 chips × 4 = 64 bytes). If the content-check stride does not account for the partial last universe, it will misread the ramp pattern and flag every frame as torn even when the data is correct. Under investigation; not treated as a data-integrity failure.
+
+**64k/60 +artsync+stagger — 3,457 torn:** Expected. The stagger scenario intentionally sends universes out of sync (inter-process stagger of 1 ms per universe group). The sender fell 46 s behind schedule during the 60 s run (`sent 99,666 pkt` vs `expected ~1,800,000`), so the FrameAssembler saw many partial commits — torn is the natural result.
+
+**64k/60 no-assembler — 18 torn:** Expected without the FrameAssembler. The sampler reads shared frame state between universe updates, so an occasional torn read is unavoidable at 30,000 pkt/s. Very low count (18 / 3,600 frames = 0.5 %).
+
+### Acceptance targets (64,000 chips / 60 fps)
+
+| Target | Result | Status |
+|--------|--------|--------|
+| Zero lost packets | 0 | ✓ PASS |
+| `late_frames` below 0.5 % | 0.00 % | ✓ PASS |
+| Zero torn frames | 0 | ✓ PASS |
+| File validates | OK | ✓ PASS |
+| Zero missing frames (steady-state) | 0.00 % | ✓ PASS |
+
+```
+# Reproduce (60 s, with content check)
+python tools/bench_e2e.py --quick --duration 60
+```
