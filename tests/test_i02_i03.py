@@ -299,49 +299,118 @@ class TestLostPacketsBaseline(unittest.TestCase):
                              % (res["lost_packets"],))
 
     def test_json_pre_recording_losses_excluded(self):
-        """JSON: build_meta with baselined lost_packets must reflect only in-recording losses."""
+        """JSON path: main.py uses start_loss_tracking/recording_lost_packets.
+
+        The JSON branch of App._toggle_record calls start_loss_tracking() and
+        App._finish_recording calls recording_lost_packets(); this test drives
+        those same functions and writes the value into a JSON file.
+        """
         from plsq import build_meta
-        from session import write_json
+        from session import (
+            ArtNetServer, write_json, start_loss_tracking, recording_lost_packets,
+        )
         import json as _json
+
+        server = ArtNetServer()           # not started: no socket needed
+        server.lost_packets = 50          # losses before Record
+        server._seq_last = {1: 17, 2: 99}
+
+        baseline = start_loss_tracking(server)
+        self.assertEqual(baseline, 50)
+        self.assertEqual(server._seq_last, {},
+                         "sequence tracking must be reset at recording start")
+
+        with server.lock:
+            server.lost_packets += 3      # losses during the recording
+        lost = recording_lost_packets(server, baseline)
+        self.assertEqual(lost, 3)
+
+        # A counter below the baseline (e.g. server restarted) never goes negative
+        self.assertEqual(recording_lost_packets(server, 1000), 0)
 
         chips = 4
         spans = _spans_for(chips)
         stride = chips * 4
-
-        # Simulate: pre-recording total = 50, in-recording addition = 3
-        pre_lost = 50
-        in_recording_lost = 3
-        baselined = max(0, (pre_lost + in_recording_lost) - pre_lost)
-
-        frame = bytes([0xAA] * stride)
-        frames = [frame] * 3
+        frames = [bytes([0xAA] * stride)] * 3
         meta = build_meta(
-            file_format="json",
-            fps=30,
-            frame_count=len(frames),
-            frame_stride=stride,
-            start_universe=1,
-            start_channel=1,
+            file_format="json", fps=30, frame_count=len(frames),
+            frame_stride=stride, start_universe=1, start_channel=1,
             chips_per_universe=effective_chips_per_universe(0),
-            universes_count=len(spans),
-            model_chips_count=chips,
-            post_skip_frames=0,
-            post_loop_blend_frames=0,
-            recorded_frames_raw=len(frames),
-            missing_frames=0,
-            late_frames=0,
-            partial_source_frames=0,
-            lost_packets=baselined,
+            universes_count=len(spans), model_chips_count=chips,
+            post_skip_frames=0, post_loop_blend_frames=0,
+            recorded_frames_raw=len(frames), missing_frames=0, late_frames=0,
+            partial_source_frames=0, lost_packets=lost,
         )
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "test.json")
             write_json(path, meta, frames)
             with open(path, "r", encoding="utf-8") as f:
                 doc = _json.load(f)
-        # build_meta stores lost_packets as a string
-        self.assertEqual(int(doc["lost_packets"]), in_recording_lost,
-                         "JSON meta lost_packets should be %d, got %s"
-                         % (in_recording_lost, doc.get("lost_packets")))
+        self.assertEqual(int(doc["lost_packets"]), 3)
+
+
+class TestLostPacketsRealServer(unittest.TestCase):
+    """I-03 integration: real ArtNetServer over UDP + PlsqRecordingSession."""
+
+    def _send(self, sock, addr, seq, chips=4):
+        sock.sendto(bytes(_make_artdmx(1, bytes([0x40] * chips * 4), seq)), addr)
+
+    def _wait_packets(self, server, n, timeout=3.0):
+        deadline = time.perf_counter() + timeout
+        while server.snapshot()[2] < n and time.perf_counter() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(server.snapshot()[2], n, "server did not receive all packets")
+
+    def test_gap_before_start_excluded_gap_after_counted(self):
+        import socket
+        from plsq import read_info, validate
+        from session import ArtNetServer, PlsqRecordingSession
+
+        chips = 4
+        server = ArtNetServer()
+        server.start("127.0.0.1", 0)
+        tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            addr = server._sock.getsockname()
+            # Before Record: seq 1, 2, 6 -> 3 packets missing (3, 4, 5)
+            for seq in (1, 2, 6):
+                self._send(tx, addr, seq)
+            self._wait_packets(server, 3)
+            self.assertEqual(server.snapshot()[6], 3)
+
+            with tempfile.TemporaryDirectory() as td:
+                out = os.path.join(td, "loss.plsq")
+                sess = PlsqRecordingSession(
+                    server, chips=chips, fps=30, out_path=out,
+                    spans=_spans_for(chips), stride=chips * 4,
+                    start_universe=1, start_channel=1,
+                    eff_cpu=effective_chips_per_universe(0),
+                    final_frames=0, wait_first_packet=False,
+                    complete_frames=False,
+                )
+                sess.start()
+                self.assertEqual(sess.state, "recording", sess.error)
+                # During the recording: seq 20, 23 -> 2 packets missing (21, 22).
+                # The jump 6 -> 20 across the start (13 packets) must NOT be
+                # counted: start_loss_tracking() resets the sequence state.
+                for seq in (20, 23):
+                    self._send(tx, addr, seq)
+                self._wait_packets(server, 5)
+                time.sleep(0.15)          # a few recorded frames
+                sess.request_stop()
+                deadline = time.perf_counter() + 10.0
+                while sess.poll() not in ("done", "error"):
+                    self.assertLess(time.perf_counter(), deadline, "session hung")
+                    time.sleep(0.02)
+                self.assertEqual(sess.state, "done", sess.error)
+                self.assertEqual(sess.result()["lost_packets"], 2)
+                self.assertFalse(validate(out))
+                _h, meta = read_info(out)
+                self.assertEqual(int(meta["lost_packets"]), 2)
+            self.assertEqual(server.snapshot()[6], 5, "server total = 3 + 2")
+        finally:
+            tx.close()
+            server.stop()
 
 
 if __name__ == "__main__":

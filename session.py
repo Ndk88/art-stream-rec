@@ -284,6 +284,30 @@ class ArtNetServer:
 
 
 # ----------------------------------------------------------------------------
+#  In-recording packet loss (I-03), shared by the JSON and PLSQ paths
+# ----------------------------------------------------------------------------
+
+def start_loss_tracking(server):
+    """Begin counting packet loss for a new recording; returns the baseline.
+
+    Clears the per-universe sequence tracking (so the jump between the last
+    pre-recording packet and the first recording packet is not counted) and
+    returns the server's lost_packets counter at this moment. Called when the
+    recording is started (Record / session.start()), not when the sampling
+    clock starts after the first assembled frame: losses in between belong to
+    the recording.
+    """
+    with server.lock:
+        server._seq_last.clear()
+        return server.lost_packets
+
+
+def recording_lost_packets(server, baseline):
+    """Sequence-gap losses counted since start_loss_tracking() returned baseline."""
+    return max(0, server.snapshot()[6] - baseline)
+
+
+# ----------------------------------------------------------------------------
 #  Recorder
 # ----------------------------------------------------------------------------
 
@@ -711,13 +735,8 @@ class PlsqRecordingSession:
             self.error = "Could not open recording file: %s" % exc
             return
 
-        # Reset per-universe sequence tracking so the gap between pre-recording
-        # and recording packets does not create false in-recording loss counts.
-        with self._server.lock:
-            self._server._seq_last.clear()
-
-        # Snapshot lost_packets baseline at recording start
-        self._lost_packets_start = self._server.snapshot()[6]
+        # I-03: reset sequence tracking and take the lost_packets baseline
+        self._lost_packets_start = start_loss_tracking(self._server)
 
         # Queue + stream writer
         q_size = max(300, int(2 * self._fps) + 20)
@@ -856,8 +875,9 @@ class PlsqRecordingSession:
         self.blend_applied = blend_applied
 
         # Lost packets in-recording only
-        lost_total = self._server.snapshot()[6]
-        lost_recording = max(0, lost_total - self._lost_packets_start)
+        lost_recording = recording_lost_packets(
+            self._server, self._lost_packets_start
+        )
 
         rec = self._recorder
         meta_kw = dict(self._meta_extra)

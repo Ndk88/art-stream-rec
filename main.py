@@ -29,6 +29,7 @@ from session import (
     path_key, next_free_path,
     ArtNetServer, FrameAssembler, Recorder, PlsqStreamWriter,
     PlsqRecordingSession,
+    start_loss_tracking, recording_lost_packets,
 )
 
 APPV = "1.2.1"
@@ -704,9 +705,7 @@ class App(tk.Tk if tk else object):
                 assembler.start(spans, stride)
             self.server.set_assembler(assembler)
             # I-03: reset sequence tracking and snapshot baseline at recording start
-            with self.server.lock:
-                self.server._seq_last.clear()
-            self._lost_packets_start = self.server.snapshot()[6]
+            self._lost_packets_start = start_loss_tracking(self.server)
             self.rec.start(
                 spans, stride, fps,
                 max_frames=(skip + final + blend) if final else 0,
@@ -846,8 +845,9 @@ class App(tk.Tk if tk else object):
         rec_missing = self.rec.missing
         rec_late = self.rec.late
         rec_partial = self.rec.partial_source_frames
-        _, _, _, _, _, _, _lost_total, _ = self.server.snapshot()
-        lost_pkts = max(0, _lost_total - getattr(self, "_lost_packets_start", 0))
+        lost_pkts = recording_lost_packets(
+            self.server, getattr(self, "_lost_packets_start", 0)
+        )
         mapping_fields = {
             "start_universe": job["start_universe"],
             "start_channel": job["start_channel"],
