@@ -30,6 +30,7 @@ from session import (
     ArtNetServer, FrameAssembler, Recorder, PlsqStreamWriter,
     PlsqRecordingSession,
     start_loss_tracking, recording_lost_packets, short_packets_warning,
+    FIRST_FRAME_PARTIAL_WARNING,
 )
 
 APPV = "1.2.1"
@@ -165,6 +166,7 @@ class App(tk.Tk if tk else object):
         self._plsq_session = None   # active PlsqRecordingSession (PLSQ only)
         self._blend_warn = None     # D11 warning, cleared on new recording
         self._short_warn = None     # I-10 warning of the last PLSQ recording
+        self._first_partial = False  # last PLSQ recording started on a partial frame
         self._prev = (time.perf_counter(), 0, {})
         self._rates = (0.0, {})
         self._build()
@@ -670,6 +672,7 @@ class App(tk.Tk if tk else object):
         self._clear_errors()
         self._blend_warn = None
         self._short_warn = None
+        self._first_partial = False
         self.vars["sequence_frame_stride"].set(str(stride))
         if is_plsq:
             # I-08: delegate PLSQ recording lifecycle to PlsqRecordingSession
@@ -880,6 +883,7 @@ class App(tk.Tk if tk else object):
         self._short_warn = short_packets_warning(
             res.get("short_packets", 0), res.get("first_short_uni")
         )
+        self._first_partial = bool(res.get("first_frame_partial"))
         try:
             size = os.path.getsize(res["path"])
         except OSError:
@@ -1297,6 +1301,12 @@ class App(tk.Tk if tk else object):
             short_line = self._short_warn
         if short_line:
             L.append((short_line, "warn"))
+        # First frame started on a partial commit (no complete frame within 2 s)
+        rec_now = sess.recorder if sess is not None else self.rec
+        if (rec_now is not None and rec_now.first_frame_partial) or (
+            sess is None and self._first_partial
+        ):
+            L.append((FIRST_FRAME_PARTIAL_WARNING, "warn"))
 
         if self.last_saved:
             L.append(("", None))

@@ -22,6 +22,8 @@ OP_SYNC = 0x5200
 RCVBUF_SIZE = 32 * 1024 * 1024   # 32 MiB requested; kernel may cap on Windows
 
 FINALIZE_TIMEOUT = 120.0  # seconds before giving up on the writer thread
+FIRST_FULL_TIMEOUT = 2.0  # max wait for the first complete assembled frame
+FIRST_FRAME_PARTIAL_WARNING = "first frame is partial"
 
 
 # ----------------------------------------------------------------------------
@@ -65,6 +67,7 @@ class FrameAssembler:
     def __init__(self):
         self.enabled = True
         self.committed_frame = None   # bytes | None; read by sampler thread
+        self.last_full_frame = None   # bytes | None; last complete (non-partial) commit
         self.partial_count = 0        # partial commits (repeat-universe or ArtSync with partial data)
         self.short_packets = 0        # packets that covered fewer channels than mapped
         self.first_short_uni = None   # port_address of first short packet (for stats warning)
@@ -80,6 +83,7 @@ class FrameAssembler:
         self._working = bytearray(stride)
         self._updated = set()
         self.committed_frame = None
+        self.last_full_frame = None
         self.partial_count = 0
         self.short_packets = 0
         self.first_short_uni = None
@@ -125,10 +129,13 @@ class FrameAssembler:
         self._commit(partial=(self._updated < self._expected))
 
     def _commit(self, partial):
-        self.committed_frame = bytes(self._working)
+        frame = bytes(self._working)
+        self.committed_frame = frame
         self._updated = set()
         if partial:
             self.partial_count += 1
+        else:
+            self.last_full_frame = frame
 
 
 def short_packets_warning(short_packets, first_universe):
@@ -340,6 +347,8 @@ class Recorder:
         self.late = 0
         self.elapsed = 0.0
         self.error = None
+        self.first_frame_partial = False
+        self.first_full_timeout = FIRST_FULL_TIMEOUT
         self._assembler = None
         self._out_queue = None
         self._stop = threading.Event()
@@ -357,6 +366,7 @@ class Recorder:
         self.missing = self.late = 0
         self.elapsed = 0.0
         self.error = None
+        self.first_frame_partial = False
         self._assembler = assembler
         self._out_queue = out_queue
         self._stop.clear()
@@ -396,13 +406,29 @@ class Recorder:
             self.state = "done"
 
     def _capture(self, wait_first_packet):
+        first_frame = None
         if wait_first_packet:
             asm = self._assembler
+            t_first_commit = None
             while not self._stop.is_set():
                 if asm is not None and asm.enabled:
-                    # Wait for a complete assembled frame so frame 0 is never zeros
-                    if asm.committed_frame is not None:
+                    # Start on the first COMPLETE assembled frame (all mapped
+                    # universes updated, or ArtSync with the full set). If only
+                    # partial commits arrive for first_full_timeout seconds,
+                    # start on a partial one and flag it.
+                    full = asm.last_full_frame
+                    if full is not None:
+                        first_frame = full
                         break
+                    part = asm.committed_frame
+                    if part is not None:
+                        now = time.perf_counter()
+                        if t_first_commit is None:
+                            t_first_commit = now
+                        elif now - t_first_commit >= self.first_full_timeout:
+                            first_frame = part
+                            self.first_frame_partial = True
+                            break
                 else:
                     with self.server.lock:
                         have = any(s[0] in self.server.latest for s in self.spans)
@@ -427,7 +453,11 @@ class Recorder:
             now = time.perf_counter()
             if now - target > 1.5 * period:
                 self.late += 1
-            frame, miss = self._sample()
+            if first_frame is not None:
+                frame, miss = first_frame, False
+                first_frame = None
+            else:
+                frame, miss = self._sample()
             if frame is None:
                 frame = bytes(self.stride)
             if self._out_queue is not None:
@@ -947,6 +977,7 @@ class PlsqRecordingSession:
             "late_frames": rec.late if rec else 0,
             "partial_source_frames": rec.partial_source_frames if rec else 0,
             "frames_captured": rec.frames_captured if rec else final,
+            "first_frame_partial": rec.first_frame_partial if rec else False,
             "short_packets": asm.short_packets if asm else 0,
             "first_short_uni": asm.first_short_uni if asm else None,
         }

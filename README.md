@@ -85,6 +85,7 @@ The recorder is a single Python file with a Tkinter window. It needs no extra pa
 | `tests/test_i08.py`                | Unit tests for I-08: `PlsqRecordingSession` lifecycle, async finalization, abort, poll timing.          |
 | `tests/test_i11.py`                | Unit tests for I-11: D11 blend reduction in PLSQ and JSON paths, blend_warning in session result.       |
 | `tests/test_short_packets_line.py` | Unit tests for the I-10 `short packets` statistics line formatter.                                      |
+| `tests/test_first_full_frame.py`    | Unit tests: recording starts on the first complete assembled frame; 2 s timeout to a partial one. |
 | `tests/test_bench_parse.py`        | Unit tests for the `bench_e2e.py` sent-packet parser (sum over all tester processes).                   |
 | `tests/test_tools.py`              | Unit tests for the tools above.                                                                         |
 | `tests/test_packets_tester.py`     | Unit tests for `packets_tester.py`.                                                                     |
@@ -212,6 +213,9 @@ Errors:
   universe of the first such packet. Usually the source patch does not match _Start channel_ / _Chips per universe_.
   Counted by the frame assembler, so only when _Wait for complete source frames_ is on. Shown live during the recording and kept
   after it until the next recording starts.
+- `first frame is partial` - yellow line: with _Wait for complete source frames_ and _Start recording on first packet_
+  the recording waits for the first complete source frame; if none arrived within 2 s after the first (partial)
+  one, the recording started on a partial frame. Universes that had not arrived yet are 0 in that frame.
 - `Preflight` - shown when recording starts; lists expected vs. received universes.
 - `Errors` - the last 6 errors with time stamps, shown in red. The list is cleared when a server or a recording starts
   successfully.
@@ -226,7 +230,9 @@ Errors:
 4. _(Optional)_ tick **Skip first frames** and/or **Loop blend**.
 5. Check the **file path**.
 6. Press **Start Record Input Data.**
-   - With _Start recording on first packet_ the clock starts when the first packet of a mapped universe arrives.
+   - With _Start recording on first packet_ the clock starts on the first complete source frame (with _Wait for
+     complete source frames_ on), or when the first packet of a mapped universe arrives (option off). If no complete
+     frame arrives within 2 s, the recording starts on a partial frame and shows `first frame is partial`.
    - If a file with this name already exists you are asked what to do (see below).
 7. The recording **stops automatically** when the planned number of frames is reached; with duration `0` press
    **Stop Record Input Data**.
@@ -363,7 +369,11 @@ until about 2 ms before the moment and then waits actively for better accuracy.
   committed yet, the sampler records zeros and counts the frame as `missing`.
 - A frame is counted as `late` if it is taken more than 1.5 periods after its planned moment, and as `missing` if no
   committed frame is available (assembler mode) or a mapped universe has not been received yet (legacy mode).
-- With _Start recording on first packet_ the clock `t0` is set when the first packet of a mapped universe arrives.
+- With _Start recording on first packet_ and the assembler on, the clock `t0` is set on the first **complete**
+  commit of the assembler (all mapped universes updated, or ArtSync with the full set); frame 0 is that frame. Partial
+  commits before it are ignored. If only partial commits arrive for 2 s (counted from the first one), recording
+  starts on the latest partial commit and `first_frame_partial` is set (yellow line `first frame is partial`). With
+  the assembler off, `t0` is set when the first packet of a mapped universe arrives.
 
 ### 4. Number of frames
 
