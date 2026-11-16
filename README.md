@@ -310,7 +310,8 @@ For 104 RGBW chips the stride is 416, so the colour of chip `c` in frame `f` is
 
 A UDP socket is bound to the chosen IP and port with a 32 MiB receive buffer (`SO_RCVBUF`; the actual value granted by the
 OS is shown in the statistics). The socket is read in a background thread with a 0.2 s timeout using `recvfrom_into` into
-a preallocated 2 KiB buffer — no per-packet allocation. Two packet types are handled:
+a preallocated, reused 2 KiB buffer (the per-universe copy of the data is still a new object per packet). Two packet
+types are handled:
 
 **ArtDMX (OpCode 0x5000)**
 
