@@ -25,6 +25,7 @@ The recorder is a single Python file with a Tkinter window. It needs no extra pa
 9. [Test source: packets_tester](#test-source-packets_tester)
 10. [Troubleshooting and notes](#troubleshooting-and-notes)
 11. [Building an .exe](#building-an-exe)
+12. [Versions and branches](#versions-and-branches)
 
 ---
 
@@ -523,3 +524,17 @@ pyinstaller --onefile --noconsole main.py
 ```
 
 The executable appears in the `dist` folder.
+
+---
+
+## Versions and branches
+
+| Ref | Purpose |
+|---|---|
+| `master` | Latest release (currently **v1.2.1**) |
+| tag `vX.Y.Z` | Exact state of every released version |
+| `dev/vX.Y.Z` | Development of the next version (currently `dev/v1.3.0`) |
+
+Released dev branches (for example `dev/v1.2.1`) are kept for history and are not developed further. To get a released version: `git checkout vX.Y.Z`.
+
+The version number is defined by `APPV` in `main.py`. It is shown in the window title and written into every recorded file as `recorder_version`.

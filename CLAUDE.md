@@ -2,6 +2,12 @@
 
 Project context for Claude Code. Read this file first, then `docs/PLSQ_SPEC.md`, then the task file you were asked to work from (`docs/TASKS_RECORDER.md` or `docs/TASKS_UE_PLUGIN.md`).
 
+## 0. Current version and branch
+
+- Working branch: `dev/v1.3.0` (`APPV` in `main.py` must be `1.3.0`)
+- Last release: `v1.2.1` (tag and `master`)
+- Before any work run `git branch --show-current`. If it is not the working branch above, stop and ask the user.
+
 ## 1. What this project is
 
 Large light installations are built from thousands of RGBW "chips". A designer drives them from TouchDesigner or Madrix 5 over Art-Net. This project has two parts:
@@ -93,3 +99,27 @@ Plugins/LightSequence/   LightSequence.uplugin, Source/LightSequence/...
 - Existing behavior that the task does not intentionally change still works.
 - README and docs are updated.
 - The final report is written as described in section 6.
+- Work is committed on the working branch from section 0.
+
+## 9. Git workflow and versions
+
+Branches
+- `master` is the last released version only, tagged `vX.Y.Z` (annotated). Never commit to it.
+- `dev/vX.Y.Z` is work towards the next version, created from `master`. Only one dev branch is active at a time (section 0).
+- Released dev branches (`dev/v1.2.1` and older) are frozen: no new work, no commits, no pushes.
+- The branch name equals `APPV` in `main.py`. `APPV` is the single source of the version number: do not hardcode it elsewhere (docs and README may show it as an example).
+- Set `APPV` to the branch version in the first commit of the branch. If a different version is needed later, tell the user instead of continuing under a mismatched branch name.
+
+Commits
+- One commit per task or issue. The message starts with its id (for example "I-05: ..."), English, imperative.
+- Never rewrite history: no rebase, no amend of pushed commits, no force push.
+- Code, tests and README/docs for one change go in the same commit.
+
+Do not do without an explicit request in the current session
+- push, merge, tag, rename or delete branches, open pull requests.
+- At the end of a session leave everything committed on the working branch. In the final report give the branch, the last commit hash, and state that nothing was pushed.
+
+Release (done by the user, for information only)
+1. `git checkout master && git merge --ff-only dev/vX.Y.Z`
+2. `git tag -a vX.Y.Z -m "Release X.Y.Z" && git push origin master vX.Y.Z`
+3. Next version: `git checkout -b dev/vA.B.C master`, then update section 0 and the README section "Versions and branches".
