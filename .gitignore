@@ -1,8 +1,14 @@
 __pycache__/
 .claude/
+.personal/
+.touchdesigner/
 *.json
 *.plsq
 *.part
 !tests/golden/conformance_v1.plsq
 .bench_out/
 %TEMP%/
+dist/
+build/
+*.spec
+*.psd
