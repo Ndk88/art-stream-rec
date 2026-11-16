@@ -65,7 +65,7 @@ A UTF-8 JSON object, flat, all values are **strings**. It holds every descriptiv
 
 Meta size limit: 65,536 bytes. The recorder MUST validate before recording starts that the meta will fit (the long free-text field is `developer_notes`).
 
-Required keys (27). The same keys, in this order, are written to JSON files:
+Required keys (27), followed by optional keys (marked *optional*). The same keys, in this order, are written to JSON files:
 
 | Key | Example | Meaning |
 |---|---|---|
@@ -96,6 +96,8 @@ Required keys (27). The same keys, in this order, are written to JSON files:
 | `partial_source_frames` | `"0"` | source frames committed incomplete (see recorder task R5); `"0"` when the source is always complete |
 | `lost_packets` | `"0"` | packets lost according to Art-Net sequence numbers; `"0"` if the source does not use sequence numbers |
 | `developer_notes` | | free text |
+| `short_packets` | `"0"` | *optional; reader must not require it.* ArtDMX packets that carried fewer DMX channels than the mapping needs for their universe (missing channels recorded as 0), whole raw recording. Written by recorder 1.2.x when the frame assembler was on; absent otherwise |
+| `first_frame_partial` | `"0"` | *optional; reader must not require it.* `"1"` if the recording started on a partial assembled frame (no complete frame within 2 s), else `"0"` |
 
 Number formatting: decimal integers without leading zeros, no separators. Keys with empty text are written as `""`, never omitted.
 

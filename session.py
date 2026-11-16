@@ -621,7 +621,8 @@ _LUT = [json.dumps(round(i / 255.0, 3)) for i in range(256)]
 def write_json(path, meta, frames):
     """Write a JSON sequence file.
 
-    meta must be the 27-key dict returned by build_meta() with file_format="json".
+    meta must be the dict returned by build_meta() with file_format="json"
+    (27 required keys, plus the optional keys when given).
     Raises ValueError when universes_count > 2 (D3).
     """
     n_uni = int(meta["input_mapping_universes_count"])
@@ -946,6 +947,8 @@ class PlsqRecordingSession:
             late_frames=rec.late if rec else 0,
             partial_source_frames=rec.partial_source_frames if rec else 0,
             lost_packets=lost_recording,
+            short_packets=asm.short_packets if asm else None,
+            first_frame_partial=rec.first_frame_partial if rec else False,
             **meta_kw,
         )
 

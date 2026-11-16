@@ -187,8 +187,15 @@ def build_meta(
     partial_source_frames=0,
     lost_packets=0,
     developer_notes="",
+    short_packets=None,
+    first_frame_partial=None,
 ):
-    """Return the 27-key meta dict in spec order. All values are strings."""
+    """Return the meta dict in spec order. All values are strings.
+
+    The 27 required keys are always present. The optional keys
+    `short_packets` and `first_frame_partial` (spec section 5) are appended
+    after `developer_notes` only when a value is given (not None).
+    """
     if sequence_id is None:
         sequence_id = str(uuid.uuid4())
     if recorded_at is None:
@@ -198,7 +205,7 @@ def build_meta(
         recorded_frames_raw = frame_count
 
     duration_sec = str(round(int(frame_count) / int(fps), 3))
-    return {
+    meta = {
         "file_format": str(file_format),
         "format_version": "1",
         "sequence_id": str(sequence_id),
@@ -227,6 +234,11 @@ def build_meta(
         "lost_packets": str(int(lost_packets)),
         "developer_notes": str(developer_notes),
     }
+    if short_packets is not None:
+        meta["short_packets"] = str(int(short_packets))
+    if first_frame_partial is not None:
+        meta["first_frame_partial"] = "1" if first_frame_partial else "0"
+    return meta
 
 
 # ---------------------------------------------------------------------------

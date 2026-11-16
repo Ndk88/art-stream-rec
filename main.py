@@ -660,6 +660,8 @@ class App(tk.Tk if tk else object):
                 late_frames=999999999999,
                 partial_source_frames=999999999999,
                 lost_packets=999999999999,
+                short_packets=999999999999,
+                first_frame_partial=True,
             )
             meta_sz = encoded_meta_size(meta_check)
             if meta_sz > 65536:
@@ -866,6 +868,12 @@ class App(tk.Tk if tk else object):
             "late": rec_late,
             "partial_source_frames": rec_partial,
             "lost_packets": lost_pkts,
+            # optional meta keys; short_packets only when the assembler counted
+            "short_packets": (
+                self.rec._assembler.short_packets
+                if self.rec._assembler is not None else None
+            ),
+            "first_frame_partial": self.rec.first_frame_partial,
         }
         self._finish_json(job, fps, mapping_fields, stats_fields)
 
@@ -987,6 +995,8 @@ class App(tk.Tk if tk else object):
             partial_source_frames=p["partial_source_frames"],
             lost_packets=p["lost_packets"],
             developer_notes=self.vars["developer_notes"].get(),
+            short_packets=p.get("short_packets"),
+            first_frame_partial=p.get("first_frame_partial"),
         )
         try:
             size = write_json(path, meta, p["frames"])

@@ -86,6 +86,7 @@ The recorder is a single Python file with a Tkinter window. It needs no extra pa
 | `tests/test_i11.py`                | Unit tests for I-11: D11 blend reduction in PLSQ and JSON paths, blend_warning in session result.       |
 | `tests/test_short_packets_line.py` | Unit tests for the I-10 `short packets` statistics line formatter.                                      |
 | `tests/test_first_full_frame.py`    | Unit tests: recording starts on the first complete assembled frame; 2 s timeout to a partial one. |
+| `tests/test_optional_meta.py`      | Unit tests: optional meta keys `short_packets` / `first_frame_partial` (reader does not require them, writers write them). |
 | `tests/test_bench_parse.py`        | Unit tests for the `bench_e2e.py` sent-packet parser (sum over all tester processes).                   |
 | `tests/test_tools.py`              | Unit tests for the tools above.                                                                         |
 | `tests/test_packets_tester.py`     | Unit tests for `packets_tester.py`.                                                                     |
@@ -244,7 +245,7 @@ Errors:
 
 ### PLSQ (`.plsq`)
 
-A compact binary format defined in `docs/PLSQ_SPEC.md`. The payload is a flat sequence of raw RGBW bytes: `chips × 4` bytes per frame, frames concatenated. A metadata JSON block is appended after the payload and the file is marked FINALIZED. All 27 meta keys (the same set as the JSON format) are stored verbatim.
+A compact binary format defined in `docs/PLSQ_SPEC.md`. The payload is a flat sequence of raw RGBW bytes: `chips × 4` bytes per frame, frames concatenated. A metadata JSON block is stored in a reserved area between the 128-byte header and the payload (offset 128) and the file is marked FINALIZED. All 27 required meta keys and the optional keys (the same set as the JSON format) are stored verbatim.
 
 The recorder writes to a `.part` file during recording and renames it to the target path atomically on success. If an error occurs (disk full, writer crash), the `.part` file is kept and an error is shown. See [How it works → Export: PLSQ (streaming)](#7-export-plsq-streaming) for the pipeline details.
 
@@ -252,7 +253,7 @@ The recorder writes to a `.part` file during recording and renames it to the tar
 
 Available for layouts using **1 or 2 universes** (up to 256 RGBW chips with the default 128 chips/universe). Refused for 3 or more universes. For larger installations use the PLSQ format.
 
-The file contains the 27 required meta keys (spec §5) in the fixed order below, then `"sequence"`:
+The file contains the 27 required meta keys (spec §5) in the fixed order below, then the optional keys, then `"sequence"`:
 
 ```json
 {
@@ -283,6 +284,8 @@ The file contains the 27 required meta keys (spec §5) in the fixed order below,
   "partial_source_frames": "0",
   "lost_packets": "0",
   "developer_notes": "",
+  "short_packets": "0",
+  "first_frame_partial": "0",
   "sequence": {
     "data": [
       0.502, 0.502, ...,
@@ -292,7 +295,11 @@ The file contains the 27 required meta keys (spec §5) in the fixed order below,
 }
 ```
 
-- All 27 meta values are **strings**. The `sequence` key follows last.
+- All meta values are **strings**. The `sequence` key follows last.
+- Optional keys (spec §5, readers must not require them; files from older recorders and the conformance file do not
+  have them): `short_packets` - number of short ArtDMX packets during the recording (written only when _Wait for
+  complete source frames_ is on); `first_frame_partial` - `"1"` if the recording started on a partial frame (see
+  `first frame is partial`), else `"0"`. The same keys are written to `.plsq` meta.
 - `sequence_id` is a UUID v4 generated at save time. `recorded_at` is the local ISO 8601 time with UTC offset.
 - `sequence.data` is a **flat array of floats** in the range 0..1 (DMX byte / 255, rounded to 3 decimals). The file has
   **one frame per line**, UTF-8 encoded with `\n` line endings.
