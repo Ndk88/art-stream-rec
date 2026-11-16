@@ -6,6 +6,7 @@
 |-----|------|------------|------|
 | Baseline | 2026-11-15 | pre-R5 | Current `ArtNetServer` + `Recorder` core, no optimisations |
 | After R5  | 2026-11-15 | post-R5 | `recvfrom_into`, SO_RCVBUF 32 MiB, `FrameAssembler`, lost-packet counter |
+| E2E final | 2026-11-15 | after I-02..I-11 + final pass | `bench_e2e.py`, full pipeline, 60 s, content check (section at the end) |
 
 ---
 
@@ -178,59 +179,97 @@ python tools/bench_e2e.py --chips 64000 --fps 60 --duration 10
 
 ---
 
-## End-to-end results after I-02..I-11 (dev/v1.2.1, 2026-11-15, 60 s each)
+## End-to-end results after I-02..I-11 (final pass, 2026-11-15, 60 s each)
 
-Measured with `tools/bench_e2e.py --quick --duration 60` on `dev/v1.2.1` after all eleven issues were committed.  Same pipeline as the 10 s baseline above: `ArtNetServer → FrameAssembler → Recorder → PlsqRecordingSession → PlsqStreamWriter` with atomic-rename finalize.
+Measured with `tools/bench_e2e.py --matrix --duration 60 --out-dir .bench_out` (content check on) on `dev/v1.2.0`
+at commit `fefa9a8` (after A1: recv % fix, Win32 CPU/memory fix, A2, A3, A4). Machine: Windows 11 10.0.26300,
+Intel Core i7-13700H, Python 3.13.5. Pipeline: `ArtNetServer → FrameAssembler → Recorder → PlsqRecordingSession →
+PlsqStreamWriter` with atomic-rename finalize. Output files were written to `.bench_out/` and deleted afterwards.
 
-> **Note — "before" 60 s run not feasible:** `session.py` was first committed in the I-02 commit (`1510284`), not in I-01, due to a known process violation (see REPORT_SUMMARY.md §"Process violations"). The worktree at `c141c8e` (pre-I-02) cannot import `session` and `bench_e2e.py` fails with `ModuleNotFoundError`. The 10 s baseline table above serves as the before reference.
+**"Before" run (commit `c141c8e`): not done.** No compatible run exists (`session.py` and the current `bench_e2e.py`
+do not exist at that commit). The I-02 race is proven by a deterministic test instead (REPORT_I02.md: the current
+`TestFirstFrameRace` fails 4/4 on `c141c8e`, passes on the fixed code).
 
-| Label | chips | fps | sent pkt | recv % | lost | late % | missing % | torn | validate |
-|-------|------:|----:|---------:|-------:|-----:|-------:|----------:|-----:|----------|
-| 1700/30 | 1,700 | 30 | 25,256 | 100.2 % | 0 | 0.00 % | **0.00 %** | 0 | OK |
-| 1700/60 | 1,700 | 60 | 50,078 | 101.1 % | 0 | 0.00 % | **0.00 %** | 0 | OK |
-| 10000/60 | 10,000 | 60 | 282,662 | 101.1 % | 0 | 0.00 % | **0.00 %** | 3,600 ⚠ | OK |
-| 32000/60 | 32,000 | 60 | 446,000 | 207.3 % | 0 | 0.00 % | **0.00 %** | 0 | OK |
-| 64000/30 | 64,000 | 30 | 224,250 | 416.8 % | 0 | 0.00 % | **0.00 %** | 0 | OK |
-| **64000/60** | **64,000** | **60** | **446,375** | **418.7 %** | **0** | **0.00 %** | **0.00 %** | **0** | **OK** |
-| 64k/60 +artsync+stagger | 64,000 | 60 | 99,666 | 416.5 % | 0 | 0.00 % | **0.00 %** | 3,457 ⚠ | OK |
-| 64k/60 no-assembler | 64,000 | 60 | 446,625 | 418.5 % | 0 | 0.00 % | **0.00 %** | 18 | OK |
+**Column definitions**
 
-**Queue**: never exceeded capacity at any matrix point.
+- `sent`: packets sent by **all** tester processes (sum of each process's final count, A1).
+- `recv %`: packets counted by `ArtNetServer` over the whole run / `sent`. A delivery ratio, not a rate.
+- `lost`: sequence-gap losses during the recording (file meta `lost_packets`).
+- `late`, `missing`: recorder counters (file meta), % of 3,600 (60 fps) or 1,800 (30 fps) frames.
+- `partial`: assembler partial commits (`partial_source_frames`).
+- `torn`: recorded frames that are not equal to any frame of the tester's ring; `zero`: all-zero frames.
+- `queue`: maximum writer-queue depth / capacity.
+- `CPU`: CPU time of the bench process (receiver + assembler + recorder + writer; the tester is a separate process)
+  during the recording. `mem`: working-set change from the 10 s mark to the end.
 
-### Key improvement: missing frames eliminated
+| Point | procs | sent | recv % | lost | late % | missing % | partial | torn | zero | queue | CPU | mem | validate |
+|-------|------:|-----:|-------:|-----:|-------:|----------:|--------:|-----:|-----:|------:|----:|----:|----------|
+| 1700/30 | 1 | 26,474 | 100.00 % | 0 | 0.00 % | 0.00 % | 0 | 0 | 0 | 1/300 | 3.9 s | -0.0 MB | OK |
+| 1700/60 | 1 | 52,934 | 100.00 % | 0 | 0.00 % | 0.00 % | 0 | 0 | 0 | 1/300 | 7.5 s | +0.0 MB | OK |
+| 10000/60 | 1 | 298,699 | 100.00 % | 0 | 0.00 % | 0.00 % | 0 | 0 | 0 | 1/300 | 4.5 s | +0.1 MB | OK |
+| 32000/60 | 2 | 945,250 | 100.00 % | 0 | 0.00 % | 0.00 % | 24 | **27** | 0 | 1/300 | 11.5 s | +0.0 MB | OK |
+| 64000/30 | 4 | 945,500 | 100.00 % | 0 | 0.00 % | 0.00 % | 0 | 0 | 0 | 1/300 | 6.8 s | +0.1 MB | OK |
+| **64000/60** | 4 | **1,890,500** | **100.00 %** | **0** | **0.00 %** | **0.00 %** | **0** | **0** | **0** | **1/300** | **15.0 s** | **+0.1 MB** | **OK** |
+| 64k/60 +artsync+stagger | 4 | 427,854 | 100.00 % | 0 | 0.00 % | 0.00 % | 897 | **3,516** | 0 | 1/300 | 12.7 s | +0.5 MB | OK |
+| 64k/60 no-assembler | 4 | 1,890,500 | 100.00 % | 0 | 0.00 % | 0.00 % | 0 | 0 | 0 | 1/300 | 15.1 s | -0.7 MB | OK |
 
-| Point | Pre-I-02 (10 s) | After I-02..I-11 (60 s) |
-|-------|----------------|--------------------------|
-| 1700/30 | 1 frame (0.33 %) | **0 frames** |
-| 1700/60 | 1 frame (0.17 %) | **0 frames** |
-| 10000/60 | 1 frame (0.17 %) | **0 frames** |
-| 32000/60 | 1 frame (0.17 %) | **0 frames** |
-| 64000/30 | 1 frame (0.33 %) | **0 frames** |
-| 64000/60 | 1 frame (0.17 %) | **0 frames** |
-| 64k/60 +artsync+stagger | 5 frames (0.83 %) | **0 frames** |
-| 64k/60 no-assembler | 0 frames | **0 frames** |
+Every point wrote exactly the expected number of frames (3,600 or 1,800, diff +0). SO_RCVBUF was not printed by
+`bench_e2e` (not measured in this run).
 
-The I-02 fix (seed the FrameAssembler before starting the Recorder sampler) eliminated the first-frame race across the board.
+### 10000/60: torn not reproduced
 
-### Torn-frame notes
+The earlier report had 3,600 torn of 3,600 frames at 10000/60. In this pass 10000/60 was run three times with
+content check (two separate 60 s runs for A4, plus the matrix run): **torn = 0 every time**. Not reproduced. The
+previous explanation ("stride of the last incomplete universe") is not confirmed by any measurement and has been
+removed.
 
-**10000/60 — 3,600 torn (100 %):** Every frame flagged as torn, yet PLSQ validation passes and lost/late/missing are all zero. Suspected cause: bench_e2e content-check uses a stride derived from `chips × 4` bytes, but 10,000 chips maps to 79 universes (last universe carries only 16 chips × 4 = 64 bytes). If the content-check stride does not account for the partial last universe, it will misread the ramp pattern and flag every frame as torn even when the data is correct. Under investigation; not treated as a data-integrity failure.
+### 32000/60: 27 torn frames (fact)
 
-**64k/60 +artsync+stagger — 3,457 torn:** Expected. The stagger scenario intentionally sends universes out of sync (inter-process stagger of 1 ms per universe group). The sender fell 46 s behind schedule during the 60 s run (`sent 99,666 pkt` vs `expected ~1,800,000`), so the FrameAssembler saw many partial commits — torn is the natural result.
+- Diagnostics of the first torn frame: frame #0. Universes U1..U84 match ring frame 4; universes U85..U250 match
+  ring frame 3 (42,496 differing bytes from the nearest ring frame, first one at byte 43,008 = U85 byte 0).
+- The tester ran in 2 processes (U1..U125 and U126..U250). The split at U85 is **not** at the process boundary.
+- The assembler made 24 partial commits in this run.
+- Hypothesis: the two tester processes send their halves independently; when one drifts by part of a frame
+  relative to the other, a universe repeats before the set is complete and the assembler commits a partial frame
+  (rule (c) in `FrameAssembler`) that mixes two source frames. The first torn frame is frame #0, so the recorder
+  also started on such a partial commit (`wait_first_packet` waits for any `committed_frame`, partial or not).
 
-**64k/60 no-assembler — 18 torn:** Expected without the FrameAssembler. The sampler reads shared frame state between universe updates, so an occasional torn read is unavoidable at 30,000 pkt/s. Very low count (18 / 3,600 frames = 0.5 %).
+### 64k/60 +artsync+stagger: 3,516 torn frames with ArtSync and assembler on (fact)
 
-### Acceptance targets (64,000 chips / 60 fps)
+- `--stagger-ms 0.05` x 500 universes = 25 ms per frame > 16.7 ms frame period: the tester printed 853 "behind
+  schedule" warnings and sent 427,854 packets in total, vs 1,890,500 without stagger.
+- 897 partial commits. Diagnostics of the first torn frame: frame #0; universes U1..U5 (and more) match no ring
+  frame; byte 1 is 0 where ring frame 0 has 1, i.e. these universes had not been received yet when the frame was
+  committed and are still zero in the working buffer.
+- Hypothesis: ArtSync is sent only by the main tester process, right after its own group (U376..U500); the three
+  worker processes send their groups without sync and, with the stagger, at a different pace. Each ArtSync then
+  commits a frame whose universes come from different source frames (and, in frame #0, some not received at all).
+  This is a property of the test source, not confirmed against a real ArtSync source (see manual check M2).
 
-| Target | Result | Status |
-|--------|--------|--------|
-| Zero lost packets | 0 | ✓ PASS |
-| `late_frames` below 0.5 % | 0.00 % | ✓ PASS |
-| Zero torn frames | 0 | ✓ PASS |
-| File validates | OK | ✓ PASS |
-| Zero missing frames (steady-state) | 0.00 % | ✓ PASS |
+### Acceptance (per point)
+
+Targets: zero lost packets, `late` below 0.5 %, zero missing frames, zero torn frames, file validates.
+
+| Point | lost = 0 | late < 0.5 % | missing = 0 | torn = 0 | validate | Result |
+|-------|:--------:|:------------:|:-----------:|:--------:|:--------:|--------|
+| 1700/30 | ✓ | ✓ | ✓ | ✓ | ✓ | PASS |
+| 1700/60 | ✓ | ✓ | ✓ | ✓ | ✓ | PASS |
+| 10000/60 | ✓ | ✓ | ✓ | ✓ | ✓ | PASS |
+| 32000/60 | ✓ | ✓ | ✓ | ✗ (27) | ✓ | **FAIL (torn)** |
+| 64000/30 | ✓ | ✓ | ✓ | ✓ | ✓ | PASS |
+| 64000/60 | ✓ | ✓ | ✓ | ✓ | ✓ | PASS |
+| 64k/60 +artsync+stagger | ✓ | ✓ | ✓ | ✗ (3,516) | ✓ | **FAIL (torn)** |
+| 64k/60 no-assembler | ✓ | ✓ | ✓ | ✓ | ✓ | PASS |
+
+The no-assembler point has 0 torn in this run (the earlier report had 18); with the assembler off, torn frames are
+possible by design, this run just did not catch one.
 
 ```
-# Reproduce (60 s, with content check)
-python tools/bench_e2e.py --quick --duration 60
+# Reproduce (60 s per point, content check on, ~10 min, ~2.2 GB of temporary files)
+python tools/bench_e2e.py --matrix --duration 60 --out-dir .bench_out
+# Single point
+python tools/bench_e2e.py --chips 10000 --fps 60 --duration 60 --out-dir .bench_out
 ```
+
+Note: `--quick` always uses 10 s and overrides `--duration`; the command `--quick --duration 60` given in the
+previous version of this section runs 10 s per point.
