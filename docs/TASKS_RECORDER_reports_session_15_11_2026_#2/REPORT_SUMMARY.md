@@ -38,9 +38,12 @@
 | `bd2513e` A2: shared loss accounting + real-UDP test | 226 | OK |
 | `406afe2` A3: short-packets line + `tests/test_short_packets_line.py` | 231 | OK |
 | `0d37bd5` C1 (docs only, before C5) | 231 | OK |
+| `7b45231` C6 (docs only) | 231 | OK |
+| `a866282` Q1: first complete frame + `tests/test_first_full_frame.py` | 236 | OK |
+| `7f48a24` Q3: optional meta keys + `tests/test_optional_meta.py` | 244 | OK |
 
 Command: `python -m unittest discover -q`  
-Latest result (final pass, after C1): `Ran 231 tests in 30.185s — OK`. The final number for the branch is in REPORT_FINAL.md.
+Latest result (after Q3): `Ran 244 tests in 31.159s — OK`. The final number for the branch is in REPORT_FINAL.md.
 
 Rows up to `4a2b54d` are from session #2 and were not re-run in the final pass.
 
@@ -87,6 +90,21 @@ Rows up to `4a2b54d` are from session #2 and were not re-run in the final pass.
 ---
 
 ## Open questions for the user
+
+**Answers received 2026-11-16 (Q1-Q3):**
+
+- Q1 (first frame can be partial): **done** in `a866282`. With the assembler and "start on first packet", recording
+  starts on the first complete assembled frame; after 2 s of partial-only commits it starts on a partial one and
+  shows the yellow line `first frame is partial`. Tests: `tests/test_first_full_frame.py`. 32000/60 re-run 3 x 60 s:
+  torn 0, frame #0 not torn, but also 0 partial commits in those runs (see `docs/BENCHMARK_RECORDER.md`).
+- Q2 (`lost_packets` window from Record): **keep as is**, nothing changed.
+- Q3 (`short_packets` in meta): **done** in `7f48a24`. Optional keys `short_packets` and `first_frame_partial` in
+  PLSQ and JSON meta; `docs/PLSQ_SPEC.md` section 5 updated (optional, readers must not require them,
+  `format_version` unchanged); golden file unchanged. Tests: `tests/test_optional_meta.py`.
+- 64k/60 +artsync+stagger removed from the acceptance criteria; kept as a stress scenario (test source: only the
+  main tester process sends ArtSync).
+
+Original questions (kept for the record):
 
 1. **Torn frames with the test source at 32000/60 (27) and 64k/60 +artsync+stagger (3,516)**: not explained;
    facts and one hypothesis each in `docs/BENCHMARK_RECORDER.md`. Whether this happens with a real ArtSync source

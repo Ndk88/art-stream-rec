@@ -131,6 +131,32 @@ OK
 
 ---
 
+## 2a. Follow-up after the user's answers (2026-11-16)
+
+| Item | Commit | Change |
+|------|--------|--------|
+| Q1 | `a866282` | Recording starts on the first complete assembled frame (`FrameAssembler.last_full_frame`); 2 s timeout to a partial one with `first_frame_partial` and the yellow line `first frame is partial`. `tests/test_first_full_frame.py` (5 tests). README. |
+| Q2 | — | `lost_packets` window unchanged (user decision). |
+| Q3 | `7f48a24` | Optional meta keys `short_packets`, `first_frame_partial` in PLSQ and JSON (strings; `short_packets` omitted when the assembler is off). `docs/PLSQ_SPEC.md` section 5: two rows, "optional; reader must not require it", `format_version` unchanged. Golden file unchanged. `tests/test_optional_meta.py` (8 tests). README. |
+| docs | this commit | BENCHMARK_RECORDER (32000/60 re-runs, artsync+stagger moved out of acceptance), REPORT_SUMMARY, REPORT_FINAL, README. |
+
+32000/60 re-runs (60 s, content check, commit `7f48a24`):
+
+```
+python tools/bench_e2e.py --chips 32000 --fps 60 --duration 60 --out-dir .bench_out   (x3)
+run 1: Sent/Received 945250 / 945250 recv=100.00%  partial_src 0  Torn / Zero 0 / 0  Validate OK
+run 2: Sent/Received 945250 / 945250 recv=100.00%  partial_src 0  Torn / Zero 0 / 0  Validate OK
+run 3: Sent/Received 945250 / 945250 recv=100.00%  partial_src 0  Torn / Zero 0 / 0  Validate OK
+meta (each run): short_packets=0 first_frame_partial=0
+```
+
+No "First torn frame" line in any run, so frame #0 is not torn. In these runs there were no partial commits at all,
+so they do not prove that Q1 removed the 27 torn frames of the matrix run (see BENCHMARK_RECORDER.md). The stress
+scenario 64k/60 +artsync+stagger is no longer an acceptance point (test source: only the main tester process sends
+ArtSync).
+
+Unit tests after Q3: `python -m unittest discover -q` -> `Ran 244 tests in 31.159s`, `OK`.
+
 ## 3. What was not verified
 
 - **Windows GUI by hand.** The A3 line was checked only by a headless smoke test (`App()` created and withdrawn,
@@ -144,6 +170,10 @@ OK
 - **SO_RCVBUF** in the e2e runs: not measured (`bench_e2e` does not print it).
 - **Memory/CPU of the tester process**: not measured (the CPU and memory columns are for the recorder side only).
 - **The original "0 packets" hang of session #2**: cause not established, not reproduced.
+- **Q1 with a real source**: the 2 s timeout and the `first frame is partial` line were checked by unit tests and a
+  headless GUI smoke test only. In the 32000/60 re-runs the timeout path was not hit.
+- **Q3 in the old Blueprint JSON parser**: whether the two extra keys are accepted by the existing Blueprint JSON
+  pipeline was not tested (manual check M3).
 
 ---
 

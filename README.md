@@ -97,7 +97,7 @@ The recorder is a single Python file with a Tkinter window. It needs no extra pa
 | `tools/convert_json_to_plsq.py`    | Convert an old JSON sequence to `.plsq`.                                                                |
 | `tools/bench_receiver.py`          | Receiver benchmark: measures pkt/s, lost packets, late frames, CPU.                                     |
 | `tools/bench_e2e.py`               | End-to-end pipeline benchmark: full capture → write → finalize cycle.                                   |
-| `docs/BENCHMARK_RECORDER.md`       | Receiver benchmark results (baseline pre-R5 and after R5).                                              |
+| `docs/BENCHMARK_RECORDER.md`       | Receiver benchmark results (pre-R5, after R5) and end-to-end results with per-point acceptance.         |
 
 ---
 
@@ -471,7 +471,7 @@ Defaults: `127.0.0.1 6454 104 1` (104 chips, 1 universe, 60 fps, rainbow pattern
 | `--chips-per-universe N`          | `0` (auto=128) | Match your source patch                         |
 | `--pattern rainbow\|ramp\|static` | `rainbow`      | Colour pattern                                  |
 | `--duration SECONDS`              | `0` (forever)  | Stop after N seconds                            |
-| `--artsync`                       | off            | Append ArtSync (OpCode 0x5200) after each frame |
+| `--artsync`                       | off            | Append ArtSync (OpCode 0x5200) after each frame; with `--procs` > 1 only the main process sends it (test source limitation) |
 | `--stagger-ms MS`                 | `0`            | Delay between consecutive universe sends        |
 | `--procs N`                       | `1`            | Split universes across N OS processes           |
 
@@ -509,7 +509,9 @@ Invalid arguments, an unresolvable host and send errors are reported in the log.
 - **Developer Notes** has a default text that is written into every file unless you edit it.
 - Errors are shown in the statistics block, not in pop-up windows. Pop-up dialogs are used only for choices about files
   and unsaved recordings.
-- Benchmark results (pkt/s, CPU, lost packets) for the full chip/fps matrix are in `docs/BENCHMARK_RECORDER.md`.
+- Benchmark results (pkt/s, CPU, lost packets, torn frames, per-point acceptance) for the full chip/fps matrix are in
+  `docs/BENCHMARK_RECORDER.md`. The run with `--artsync --stagger-ms` is a stress scenario of the test source, not an
+  acceptance point.
 
 ---
 

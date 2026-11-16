@@ -210,7 +210,7 @@ do not exist at that commit). The I-02 race is proven by a deterministic test in
 | 32000/60 | 2 | 945,250 | 100.00 % | 0 | 0.00 % | 0.00 % | 24 | **27** | 0 | 1/300 | 11.5 s | +0.0 MB | OK |
 | 64000/30 | 4 | 945,500 | 100.00 % | 0 | 0.00 % | 0.00 % | 0 | 0 | 0 | 1/300 | 6.8 s | +0.1 MB | OK |
 | **64000/60** | 4 | **1,890,500** | **100.00 %** | **0** | **0.00 %** | **0.00 %** | **0** | **0** | **0** | **1/300** | **15.0 s** | **+0.1 MB** | **OK** |
-| 64k/60 +artsync+stagger | 4 | 427,854 | 100.00 % | 0 | 0.00 % | 0.00 % | 897 | **3,516** | 0 | 1/300 | 12.7 s | +0.5 MB | OK |
+| 64k/60 +artsync+stagger (stress, test source; not an acceptance point) | 4 | 427,854 | 100.00 % | 0 | 0.00 % | 0.00 % | 897 | **3,516** | 0 | 1/300 | 12.7 s | +0.5 MB | OK |
 | 64k/60 no-assembler | 4 | 1,890,500 | 100.00 % | 0 | 0.00 % | 0.00 % | 0 | 0 | 0 | 1/300 | 15.1 s | -0.7 MB | OK |
 
 Every point wrote exactly the expected number of frames (3,600 or 1,800, diff +0). SO_RCVBUF was not printed by
@@ -223,7 +223,7 @@ content check (two separate 60 s runs for A4, plus the matrix run): **torn = 0 e
 previous explanation ("stride of the last incomplete universe") is not confirmed by any measurement and has been
 removed.
 
-### 32000/60: 27 torn frames (fact)
+### 32000/60: 27 torn frames in the matrix run (fact)
 
 - Diagnostics of the first torn frame: frame #0. Universes U1..U84 match ring frame 4; universes U85..U250 match
   ring frame 3 (42,496 differing bytes from the nearest ring frame, first one at byte 43,008 = U85 byte 0).
@@ -234,7 +234,12 @@ removed.
   (rule (c) in `FrameAssembler`) that mixes two source frames. The first torn frame is frame #0, so the recorder
   also started on such a partial commit (`wait_first_packet` waits for any `committed_frame`, partial or not).
 
-### 64k/60 +artsync+stagger: 3,516 torn frames with ArtSync and assembler on (fact)
+### Stress scenario 64k/60 +artsync+stagger (test source; not an acceptance point)
+
+Test source: with `--procs` > 1 only the main `packets_tester.py` process sends ArtSync. This run is kept as a
+stress scenario and is **not** part of the acceptance table below. Result: 3,516 torn frames with ArtSync and the
+assembler on (fact).
+
 
 - `--stagger-ms 0.05` x 500 universes = 25 ms per frame > 16.7 ms frame period: the tester printed 853 "behind
   schedule" warnings and sent 427,854 packets in total, vs 1,890,500 without stagger.
@@ -246,19 +251,41 @@ removed.
   commits a frame whose universes come from different source frames (and, in frame #0, some not received at all).
   This is a property of the test source, not confirmed against a real ArtSync source (see manual check M2).
 
+### 32000/60 re-runs after Q1 (first complete frame), 2026-11-16
+
+After Q1 (commit `a866282`: with the assembler and "start on first packet" the recording starts on the first
+complete assembled frame, 2 s timeout) and Q3 (`7f48a24`), 32000/60 was run three more times, 60 s each, content
+check on, at commit `7f48a24`:
+
+```
+python tools/bench_e2e.py --chips 32000 --fps 60 --duration 60 --out-dir .bench_out   (x3)
+```
+
+| Run | sent / recv | recv % | lost | late % | missing % | partial | torn | zero | frame #0 torn | queue | CPU | validate | meta `short_packets` / `first_frame_partial` |
+|-----|-------------|-------:|-----:|-------:|----------:|--------:|-----:|-----:|:-------------:|------:|----:|----------|----------|
+| 1 | 945,250 / 945,250 | 100.00 % | 0 | 0.00 % | 0.00 % | 0 | 0 | 0 | no | 1/300 | 8.4 s | OK | `"0"` / `"0"` |
+| 2 | 945,250 / 945,250 | 100.00 % | 0 | 0.00 % | 0.00 % | 0 | 0 | 0 | no | 1/300 | 11.7 s | OK | `"0"` / `"0"` |
+| 3 | 945,250 / 945,250 | 100.00 % | 0 | 0.00 % | 0.00 % | 0 | 0 | 0 | no | 1/300 | 10.0 s | OK | `"0"` / `"0"` |
+
+Tester: 2 processes, no "behind schedule" warnings. **Limitation:** in all three re-runs the assembler made no
+partial commit at all (`partial` = 0, vs 24 in the matrix run), so the situation that Q1 fixes (a partial commit
+before the first complete one) did not occur. The re-runs show 0 torn, but they do not prove that Q1 removed the 27
+torn frames of the matrix run; the Q1 behavior is covered by unit tests (`tests/test_first_full_frame.py`).
+
 ### Acceptance (per point)
 
-Targets: zero lost packets, `late` below 0.5 %, zero missing frames, zero torn frames, file validates.
+Targets: zero lost packets, `late` below 0.5 %, zero missing frames, zero torn frames, file validates. The stress
+scenario 64k/60 +artsync+stagger is not an acceptance point (see above).
 
 | Point | lost = 0 | late < 0.5 % | missing = 0 | torn = 0 | validate | Result |
 |-------|:--------:|:------------:|:-----------:|:--------:|:--------:|--------|
 | 1700/30 | ✓ | ✓ | ✓ | ✓ | ✓ | PASS |
 | 1700/60 | ✓ | ✓ | ✓ | ✓ | ✓ | PASS |
 | 10000/60 | ✓ | ✓ | ✓ | ✓ | ✓ | PASS |
-| 32000/60 | ✓ | ✓ | ✓ | ✗ (27) | ✓ | **FAIL (torn)** |
+| 32000/60, matrix run (before Q1) | ✓ | ✓ | ✓ | ✗ (27) | ✓ | **FAIL (torn)** |
+| 32000/60, 3 re-runs after Q1 | ✓ | ✓ | ✓ | ✓ (0, 0, 0) | ✓ | PASS |
 | 64000/30 | ✓ | ✓ | ✓ | ✓ | ✓ | PASS |
 | 64000/60 | ✓ | ✓ | ✓ | ✓ | ✓ | PASS |
-| 64k/60 +artsync+stagger | ✓ | ✓ | ✓ | ✗ (3,516) | ✓ | **FAIL (torn)** |
 | 64k/60 no-assembler | ✓ | ✓ | ✓ | ✓ | ✓ | PASS |
 
 The no-assembler point has 0 torn in this run (the earlier report had 18); with the assembler off, torn frames are
