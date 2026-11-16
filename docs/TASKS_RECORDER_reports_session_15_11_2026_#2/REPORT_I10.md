@@ -80,6 +80,8 @@ Result: `Ran 195 tests in 24.579s — OK`
 
 The warning line in the GUI statistics block ("short packets: N (e.g. U7 sends 416 channels, mapping needs 512)") is not implemented. It will be added as part of the GUI statistics pass (along with I-04…I-07 GUI work).
 
+**Update (final pass, A3, commit `406afe2`):** done. The statistics block shows a yellow line `short packets: N (first universe U)` when N > 0 (formatter `session.short_packets_warning()`, tests in `tests/test_short_packets_line.py`; README updated).
+
 ---
 
 ## Commits
