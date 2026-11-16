@@ -5,3 +5,4 @@ __pycache__/
 *.part
 !tests/golden/conformance_v1.plsq
 .bench_out/
+%TEMP%/
