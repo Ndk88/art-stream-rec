@@ -82,7 +82,9 @@ How to work: one task per session unless told otherwise. Each task has a goal, r
 - `ULightSequencePlayer::GetSequenceInfo()` and `GetSequenceInfoAsJson()`: a compact JSON object with all meta keys (values as strings, unknown keys included) plus `file_name` and `file_size_bytes`. This string is what the user sends over Pixel Streaming.
 - `ULightSequenceLibrary` (Blueprint function library): `ReadSequenceInfo(Path, bSuccess, Info, ErrorCode)` reading only header + meta (no payload, safe to call for many files); `ListSequences(DirectoryPath) -> TArray<FLightSequenceInfo>` for `.plsq` files.
 
-**Acceptance.** Test confirms that every one of the 27 required keys, and an extra unknown key injected into a test file, appears in `GetSequenceInfoAsJson()`; `ListSequences` on a folder with 100 files returns quickly (no payload read, report the time).
+- Optional meta keys (recorder 1.2.x, see `docs/PLSQ_SPEC.md` section 5): `short_packets` and `first_frame_partial`. They may be absent in older files. The reader must not require them; `FLightSequenceInfo` exposes them as `ShortPackets` (int32, 0 if absent) and `bFirstFramePartial` (bool, false if absent) and keeps them in `AllFields` and in the JSON string only when present. The player shows a warning in the Output Log (and the info JSON stays untouched) when `short_packets > 0` or `first_frame_partial == "1"`.
+
+**Acceptance.** Test confirms that every one of the 27 required keys, the two optional keys (when present; and a file without them still loads), and an extra unknown key injected into a test file, appear in `GetSequenceInfoAsJson()` as stored; `ListSequences` on a folder with 100 files returns quickly (no payload read, report the time).
 
 ---
 
