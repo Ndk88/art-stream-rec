@@ -104,5 +104,5 @@
   "format_version": "1",
   "generated_by": "tools/make_test_vectors.py",
   "recorder_version": "1.2.2",
-  "spec_commit": "7f48a24c7876dd7e4fe47cc9f20bc3bb0cf70634"
+  "spec_commit": "1076efc858f8fd9796e0c60e0831a934406ba732"
 }
