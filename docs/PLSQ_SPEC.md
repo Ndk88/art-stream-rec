@@ -155,7 +155,7 @@ A reader MUST perform these checks in order and report the first failure with th
 | Code | Check |
 |---|---|
 | `IoError` | file cannot be opened or read |
-| `Truncated` | file shorter than 128 bytes, or shorter than `payload_offset + payload_size` |
+| `Truncated` | file shorter than 128 bytes |
 | `BadMagic` | magic is not `PLSQ` |
 | `UnsupportedVersion` | `format_version` is not 1 |
 | `BadHeaderSize` | `header_size` < 128 |
@@ -165,11 +165,14 @@ A reader MUST perform these checks in order and report the first failure with th
 | `UnsupportedLayout` | `channels_per_chip` is not 4 |
 | `OutOfRange` | `chips_count` not in 1..64,000; `fps` not in 1..240; `frame_count` < 1; `start_universe` > 32,767 or `start_universe + universes_count - 1` > 32,767; `start_channel` not in 1..512; `chips_per_universe` not in 1..128 |
 | `InconsistentHeader` | `frame_stride` != `chips_count x 4`; `payload_size` != `frame_count x frame_stride`; `payload_offset` not a multiple of 4096 or < `meta_offset + meta_size`; `universes_count` differs from the value computed with the mapping rules |
+| `Truncated` | file shorter than `payload_offset + payload_size` |
 | `MetaOutOfBounds` | `meta_size` not in 2..65,536, or meta lies outside the file |
 | `MetaCrcMismatch` | CRC of the meta bytes differs from `meta_crc32` |
 | `MetaParseError` | meta is not a JSON object of string values |
 | `MissingMetaKey` | a required key (section 5) is absent |
 | `MetaMismatch` | a pair from section 6 differs |
+
+`Truncated` appears twice: the 128-byte check comes first, the payload-size check comes after `InconsistentHeader`, because the size fields of the header are used only after the header CRC and the header consistency have been checked.
 
 Extra bytes after `payload_offset + payload_size` are a warning (`TrailingData`), not an error.
 

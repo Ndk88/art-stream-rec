@@ -214,6 +214,67 @@ class TestErrorVectors(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Order of checks (spec section 10): files with two defects
+# ---------------------------------------------------------------------------
+
+SPEC_ORDER = [
+    "IoError", "Truncated", "BadMagic", "UnsupportedVersion", "BadHeaderSize",
+    "HeaderCrcMismatch", "UnsupportedFlags", "NotFinalized", "UnsupportedLayout",
+    "OutOfRange", "InconsistentHeader", "Truncated", "MetaOutOfBounds",
+    "MetaCrcMismatch", "MetaParseError", "MissingMetaKey", "MetaMismatch",
+]
+
+
+class TestCheckOrder(unittest.TestCase):
+    """The payload-size Truncated check comes after InconsistentHeader."""
+
+    @classmethod
+    def setUpClass(cls):
+        # Valid header, payload cut inside frame 4.
+        cls.cut = _read(os.path.join(ERRORS_DIR, "err_truncated_payload.plsq"))
+
+    def _codes(self, data):
+        fd, path = tempfile.mkstemp(suffix=".plsq")
+        with os.fdopen(fd, "wb") as fp:
+            fp.write(data)
+        self.addCleanup(os.remove, path)
+        try:
+            plsq.read_info(path)
+            got_read = ""
+        except PlsqError as exc:
+            got_read = exc.code
+        problems = plsq.validate(path)
+        return got_read, problems[0].split(":")[0] if problems else ""
+
+    def test_spec_table_order(self):
+        with open(os.path.join(ROOT, "docs", "PLSQ_SPEC.md"), encoding="utf-8") as fp:
+            text = fp.read()
+        sec = text.split("## 10.")[1].split("## 11.")[0]
+        codes = re.findall(r"^\| `(\w+)` \|", sec, flags=re.M)
+        self.assertEqual(codes, SPEC_ORDER)
+
+    def test_truncated_payload_and_header_crc(self):
+        bad = bytearray(self.cut)
+        bad[18] ^= 0x01  # fps byte changed, header CRC not updated
+        self.assertEqual(self._codes(bytes(bad)),
+                         ("HeaderCrcMismatch", "HeaderCrcMismatch"))
+
+    def test_truncated_payload_and_out_of_range(self):
+        self.assertEqual(self._codes(mtv._with_header(self.cut, fps=0)),
+                         ("OutOfRange", "OutOfRange"))
+
+    def test_truncated_payload_and_inconsistent_header(self):
+        self.assertEqual(
+            self._codes(mtv._with_header(self.cut, frame_stride=516)),
+            ("InconsistentHeader", "InconsistentHeader"),
+        )
+
+    def test_truncated_payload_before_meta_out_of_bounds(self):
+        self.assertEqual(self._codes(mtv._with_header(self.cut, meta_size=1)),
+                         ("Truncated", "Truncated"))
+
+
+# ---------------------------------------------------------------------------
 # Frame-stamp files
 # ---------------------------------------------------------------------------
 
