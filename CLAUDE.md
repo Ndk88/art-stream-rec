@@ -78,6 +78,8 @@ packets_tester.py        test Art-Net source (extended)
 tools/                   validate_plsq.py, convert_json_to_plsq.py, gen_synthetic.py,
                          make_golden.py, bench_receiver.py
 tests/                   unittest + tests/golden/conformance_v1.plsq
+                         + tests/golden/errors/, tests/golden/stamp/ (test vectors for the
+                         UE plugin, made by tools/make_test_vectors.py)
 docs/                    PLSQ_SPEC.md, TASKS_*.md, BENCHMARK_RECORDER.md (after R8)
 ```
 
