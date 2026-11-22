@@ -6,6 +6,8 @@ __pycache__/
 *.plsq
 *.part
 !tests/golden/conformance_v1.plsq
+!tests/golden/errors/*
+!tests/golden/stamp/*
 .bench_out/
 %TEMP%/
 dist/

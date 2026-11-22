@@ -1,0 +1,108 @@
+{
+  "files": {
+    "err_bad_header_size.plsq": {
+      "code": "BadHeaderSize",
+      "note": "header_size = 64, header CRC recomputed",
+      "result": "error"
+    },
+    "err_bad_magic.plsq": {
+      "code": "BadMagic",
+      "note": "magic = PLSX, header CRC recomputed",
+      "result": "error"
+    },
+    "err_header_crc.plsq": {
+      "code": "HeaderCrcMismatch",
+      "note": "header byte 18 (fps low byte) changed 30 -> 31, CRC not updated",
+      "result": "error"
+    },
+    "err_inconsistent_header.plsq": {
+      "code": "InconsistentHeader",
+      "note": "frame_stride = 516 (chips_count x 4 = 520), payload_size left at 5200 (so payload_size != frame_count x frame_stride is violated too, same code), header CRC recomputed",
+      "result": "error"
+    },
+    "err_meta_crc.plsq": {
+      "code": "MetaCrcMismatch",
+      "note": "first letter of model_name changed T -> t, meta CRC not updated",
+      "result": "error"
+    },
+    "err_meta_mismatch.plsq": {
+      "code": "MetaMismatch",
+      "note": "sequence_fps = 60, header fps = 30; meta size, meta CRC and header CRC recomputed",
+      "result": "error"
+    },
+    "err_meta_out_of_bounds.plsq": {
+      "code": "MetaOutOfBounds",
+      "note": "meta_size = 1, header CRC recomputed",
+      "result": "error"
+    },
+    "err_meta_parse.plsq": {
+      "code": "MetaParseError",
+      "note": "lost_packets is the JSON number 0, not a string; meta size, meta CRC and header CRC recomputed",
+      "result": "error"
+    },
+    "err_missing_meta_key.plsq": {
+      "code": "MissingMetaKey",
+      "note": "required key model_name removed; meta size, meta CRC and header CRC recomputed",
+      "result": "error"
+    },
+    "err_not_finalized.plsq.part": {
+      "code": "NotFinalized",
+      "note": "real interrupted 64000-chip 60 fps recording (placeholder header: FINALIZED = 0, frame_count = 0, meta_size = 2), cut to payload_offset + 2 x frame_stride (256000) = 581632 bytes",
+      "result": "error"
+    },
+    "err_out_of_range.plsq": {
+      "code": "OutOfRange",
+      "note": "fps = 0, header CRC recomputed",
+      "result": "error"
+    },
+    "err_truncated_payload.plsq": {
+      "code": "Truncated",
+      "note": "valid header and meta, file cut inside frame 4 (71972 of 74832 bytes)",
+      "result": "error"
+    },
+    "err_truncated_short.plsq": {
+      "code": "Truncated",
+      "note": "first 127 bytes of a valid file",
+      "result": "error"
+    },
+    "err_unsupported_flags.plsq": {
+      "code": "UnsupportedFlags",
+      "note": "flags = FINALIZED | COMPRESSED (3), header CRC recomputed",
+      "result": "error"
+    },
+    "err_unsupported_layout.plsq": {
+      "code": "UnsupportedLayout",
+      "note": "channels_per_chip = 3 (frame_stride left at 520), header CRC recomputed",
+      "result": "error"
+    },
+    "err_unsupported_version.plsq": {
+      "code": "UnsupportedVersion",
+      "note": "format_version = 2, header CRC recomputed",
+      "result": "error"
+    },
+    "ok_no_optional_keys.plsq": {
+      "code": "",
+      "note": "valid, meta without short_packets and first_frame_partial",
+      "result": "ok"
+    },
+    "ok_optional_keys.plsq": {
+      "code": "",
+      "note": "valid, meta with short_packets = 3 and first_frame_partial = 1",
+      "result": "ok"
+    },
+    "ok_trailing_data.plsq": {
+      "code": "TrailingData",
+      "note": "valid file + 16 bytes 0xA5 after the payload",
+      "result": "warning"
+    },
+    "ok_unknown_key.plsq": {
+      "code": "",
+      "note": "meta key x_test_unknown = kept (must be passed through)",
+      "result": "ok"
+    }
+  },
+  "format_version": "1",
+  "generated_by": "tools/make_test_vectors.py",
+  "recorder_version": "1.2.2",
+  "spec_commit": "7f48a24c7876dd7e4fe47cc9f20bc3bb0cf70634"
+}
