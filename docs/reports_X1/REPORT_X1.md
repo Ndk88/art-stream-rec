@@ -11,6 +11,14 @@ Machine: Windows 11, Python 3.13.5. Nothing was pushed.
 | `X1: Add PLSQ error vectors and make_test_vectors tool` | `tools/make_test_vectors.py`, `tests/golden/errors/` (20 files + `expected.json` + `README.md`), `tests/test_test_vectors.py`, `.gitignore` allow-list |
 | `X1: Add frame-stamp test files and verify mode` | `tests/golden/stamp/` (2 files + `README.md`) |
 | `X1: Update README, CLAUDE.md and add report` | `README.md` (files table, section "Test vectors for the UE plugin", example `recorder_version`), short note in `CLAUDE.md` section 7, this report |
+| `X1: Add .gitattributes: tests/golden/** -text` | `.gitattributes` (follow-up decision 2, section 6) |
+| `X1: Move payload Truncated check after InconsistentHeader in spec` | `docs/PLSQ_SPEC.md` section 10, `tests/test_test_vectors.py` (class `TestCheckOrder`) (follow-up decision 1) |
+| `X1: Regenerate expected.json for the updated spec commit` | `tests/golden/errors/expected.json`: only `spec_commit` changed |
+| `X1: Update report after spec and gitattributes decisions` | this report |
+
+Between the spec commit and the `expected.json` commit one test (`test_spec_commit_matches_spec_history`) fails
+by design: `expected.json` can only name the spec commit after that commit exists. It passes again from the next
+commit on.
 
 Note on the commit split: `tools/make_test_vectors.py` and `tests/test_test_vectors.py` are one file each and were
 committed whole in the first `X1:` commit, so the stamp generator, `--verify-stamp` and the stamp tests are already
@@ -39,12 +47,10 @@ No changes to `plsq.py`: the tool uses the existing private helpers `plsq._pack_
 
 ## 2. Files (size, SHA-256)
 
-SHA-256 of the committed content (git blobs; equal to the working tree files written by the script, which uses
-`\n` line endings). **Note:** the repository has `core.autocrlf = true` and no `.gitattributes`; the `.plsq`/`.part`
-files are detected as binary and are never converted, but `expected.json` and the two `README.md` files are text
-and may be checked out with CRLF on Windows, which changes their SHA-256 (not their JSON content). When checking a
-copy, compare the `.plsq`/`.part` hashes exactly and `expected.json` after JSON parsing (or `git show
-HEAD:<path> | sha256sum`).
+SHA-256 of the committed content. The repository has `core.autocrlf = true`; since the commit
+`X1: Add .gitattributes` the rule `tests/golden/** -text` disables line-ending conversion for all golden files, so
+`expected.json` and the READMEs are checked out with `\n` exactly as committed and the hashes below hold for a
+fresh checkout too (verified, section 4). The `.plsq`/`.part` files were binary for git before as well.
 
 | File | Bytes | SHA-256 |
 |---|---|---|
@@ -65,7 +71,7 @@ HEAD:<path> | sha256sum`).
 | `tests/golden/errors/err_unsupported_flags.plsq` | 74832 | `022ceffd18048a48f6a6abe83d37c66868299ba8a81359cca78f936c11c28979` |
 | `tests/golden/errors/err_unsupported_layout.plsq` | 74832 | `9deec4d67e566b408eff927be1dba736b73621dcc83047acc762e88816a8ca4f` |
 | `tests/golden/errors/err_unsupported_version.plsq` | 74832 | `678322cab4d7e93b2f24d7568befa9e8c5c27e7d427f9e64d8dbb39245e49b8e` |
-| `tests/golden/errors/expected.json` | 3761 | `5e08067b7add6fa1fa29ed185f904e29e4c99a2672a318bb1a75f39c75114305` |
+| `tests/golden/errors/expected.json` | 3761 | `f1f85064adee17f80808710d18cafe3571ef6a07f0e39fdb040c93bbc99874f0` |
 | `tests/golden/errors/ok_no_optional_keys.plsq` | 74832 | `af3d356bcaaeaf13ff43e988963276250fda8b6231913c6efea087647b8fdb20` |
 | `tests/golden/errors/ok_optional_keys.plsq` | 74832 | `a316d6fc18bb75a24d802d8def620547eab8a10a5f5a518037fc7e52e5ee5f2c` |
 | `tests/golden/errors/ok_trailing_data.plsq` | 74848 | `e0d67b58908afe886724928c1a726bf53ac2d97238f22ac84b78d882c1172081` |
@@ -74,8 +80,10 @@ HEAD:<path> | sha256sum`).
 | `tests/golden/stamp/stamp_130c_30fps_300f.plsq` | 225632 | `e4afd970798c0fcd105d9bc5f1518be513ff179ef16ea1cfc4371b033cc4452d` |
 | `tests/golden/stamp/stamp_1c_60fps_10f.plsq` | 69672 | `eac1028600a7be552bee0a156b24745d438eb74c1f91e550a166e1c2fcac3f3b` |
 
-`expected.json`: `spec_commit = 7f48a24c7876dd7e4fe47cc9f20bc3bb0cf70634` (last commit that touched
-`docs/PLSQ_SPEC.md`; `PLSQ_SPEC.md` is unchanged on this branch).
+`expected.json`: `spec_commit = 1076efc858f8fd9796e0c60e0831a934406ba732` (last commit that touched
+`docs/PLSQ_SPEC.md`: the section 10 order change on this branch). The first version of `expected.json` named
+`7f48a24c7876dd7e4fe47cc9f20bc3bb0cf70634` (SHA-256 `5e08067b...4305`); all other files are unchanged by the
+regeneration.
 
 NotFinalized source (read only): `art-stream-uep/test_data/M1_9.plsq.part`, 193,861,632 bytes, SHA-256
 `4a0be2ea74d31df69abdaefc66569984b13341d1976181a7f0a5a694d4f8f111` before and after (checked by the script and
@@ -114,12 +122,15 @@ Every vector fails at the intended check in both `plsq.read_info()` and `plsq.va
 Full suite (before the task: 244 tests):
 
 ```
-> python -m unittest discover -q
+> python -m unittest discover -q          (after the first four commits)
 Ran 267 tests in 32.846s
+OK
+> python -m unittest discover -q          (final, after the spec order tests)
+Ran 272 tests in 32.638s
 OK
 ```
 
-New module alone (23 tests):
+New module alone (23 tests at first, 28 after `TestCheckOrder`):
 
 ```
 > python -m unittest tests.test_test_vectors
@@ -129,7 +140,25 @@ OK
 test_regenerate_not_finalized_identical ... skipped 'NotFinalized source not available (...); err_not_finalized.plsq.part not regenerated'
 Ran 23 tests in 1.165s
 OK (skipped=1)
+> python -m unittest tests.test_test_vectors          (final)
+Ran 28 tests in 1.613s
+OK
 ```
+
+`TestCheckOrder` (spec section 10 after the change): the codes of the section 10 table, read from
+`docs/PLSQ_SPEC.md`, are exactly in the order `IoError, Truncated, BadMagic, ..., OutOfRange, InconsistentHeader,
+Truncated, MetaOutOfBounds, ..., MetaMismatch`; files with two defects built from `err_truncated_payload.plsq`
+give the same first code in `read_info()` and `validate()`:
+
+| Second defect (plus the cut payload) | Expected and actual |
+|---|---|
+| header byte 18 changed, CRC not updated | `HeaderCrcMismatch` |
+| `fps = 0`, CRC recomputed | `OutOfRange` |
+| `frame_stride = 516`, CRC recomputed | `InconsistentHeader` |
+| `meta_size = 1`, CRC recomputed | `Truncated` (before `MetaOutOfBounds`) |
+
+`plsq.validate()` already had this order (`_validate_body`: ... `OutOfRange`, `InconsistentHeader`, payload
+`Truncated`, `MetaOutOfBounds`, ...), the same as `read_info()` (`_check_header`); `plsq.py` was not changed.
 
 The tests cover: result and code of every file in `read_info()` and as first problem of `validate()`;
 `expected.json` lists exactly the files in the folder and has the format of the task; `IoError` with a missing path;
@@ -180,8 +209,18 @@ SHA-256 above can be used to check a copy or a regeneration on another machine.
 
 `.gitignore`: `git check-ignore -v` shows the new rules apply to `tests/golden/errors/*` and
 `tests/golden/stamp/*` only; `tests/golden/foo.plsq` and `x.json` stay ignored by `*.plsq` / `*.json`;
-`git status` showed no other new tracked files. `tests/golden/conformance_v1.plsq`, `plsq.py`, `mapping.py`,
-`session.py` and `docs/PLSQ_SPEC.md` are unchanged (`git diff badf6c8` touches only `APPV` in `main.py`).
+`git status` showed no other new tracked files. `tests/golden/conformance_v1.plsq`, `plsq.py`, `mapping.py` and
+`session.py` are unchanged; in `main.py` only `APPV` changed; `docs/PLSQ_SPEC.md` changed only in section 10 (by
+decision, section 6).
+
+Fresh checkout of the golden files (after `.gitattributes` and the final `expected.json`): all 25 files of
+`tests/golden/errors/` and `tests/golden/stamp/` were checked out again with `git checkout-index -f
+--prefix=.bench_out/recheckout2/` (a real checkout with attributes and `core.autocrlf = true` applied, into the
+git-ignored `.bench_out/`). For each file the SHA-256 of the checked-out copy, of the git blob and of the working tree
+file are equal and equal to the table in section 2 (`25 same`). `git ls-files --eol tests/golden` shows
+`attr/-text` for all 26 files (23 binary, 3 text files with `lf` in the index and in the working tree). A control
+checkout without `.gitattributes` was attempted but is not conclusive (git still read the attributes from the
+index), so the CRLF effect without the rule is not demonstrated here.
 
 ## 5. What could not be verified
 
@@ -190,7 +229,18 @@ SHA-256 above can be used to check a copy or a regeneration on another machine.
   task: done by the user).
 - Disk-bound write speed of the large stamp file (see note above).
 
-## 6. Open questions
+## 6. Questions and decisions
+
+Both questions below were raised in the first version of this report; the user decided:
+
+- Question 1: **option (b)**. `docs/PLSQ_SPEC.md` section 10 now has two `Truncated` rows: "file shorter than 128
+  bytes" stays second; "file shorter than `payload_offset + payload_size`" follows `InconsistentHeader`, before
+  `MetaOutOfBounds`. One sentence after the table gives the reason (size fields are used only after the header CRC
+  and the header consistency have been checked). `format_version` and the file format are unchanged; `plsq.py`
+  already followed this order. Tests: `TestCheckOrder` (section 4).
+- Question 2: **yes**, `.gitattributes` with `tests/golden/** -text` (section 2 and 4).
+
+No open questions remain from this task. Original text of the questions:
 
 1. **Order of the payload `Truncated` check: `plsq.py` differs from the spec order.** The spec (section 10) lists
    `Truncated` (including "shorter than `payload_offset + payload_size`") as the second check, before `BadMagic`.
